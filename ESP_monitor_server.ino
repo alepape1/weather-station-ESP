@@ -2,6 +2,7 @@
 
 #include "WiFi.h"
 #include <HTTPClient.h>
+#include "secrets.h"
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -23,11 +24,11 @@ const int anemometerPin = 37;
 const int vanePin = 36;
 const int ledPin = 2;
 
-// --- CONFIGURACIÓN DE RED ---
-const char* ssid = "Promicon_Fibra-ea7i";
-const char* password = "d6dlda8k";
-const char* server_ip = "192.168.1.42";
-const int server_port = 5000;
+// --- CONFIGURACIÓN DE RED (definida en secrets.h) ---
+const char* ssid       = WIFI_SSID;
+const char* password   = WIFI_PASSWORD;
+const char* server_ip  = SERVER_IP;
+const int   server_port = SERVER_PORT;
 
 // --- OBJETOS ---
 SparkFun_MicroPressure barometer;
