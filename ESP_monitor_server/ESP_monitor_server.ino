@@ -1,5 +1,5 @@
 // MeteoStation — Firmware v3
-// LilyGo T-Display-S3 (ST7789, 320×170)
+// ST7789, 135×240 (landscape: 240×135)
 // Simulación automática por sensor con badge REAL/SIM en pantalla
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
@@ -148,15 +148,15 @@ unsigned long lastScreenTime = 0;
 #define C_REAL    0x07E0   // verde (real)
 #define C_RED     0xF800
 
-// ── Layout (320×170) ──────────────────────────────────────────────────────────
-// Cabecera: y=0..21 (22px)
+// ── Layout (240×135) ──────────────────────────────────────────────────────────
+// Cabecera: y=0..17 (18px)
 // 2 filas × 3 columnas
-// CARD_W=106, CARD_H=73, gap horizontal=1, gap vertical=2
-//   col x: 0, 107, 214
-//   row y: 22, 97
-#define HDR_H    22
-#define CARD_W  106
-#define CARD_H   73
+// CARD_W=79, CARD_H=57, gap horizontal=1, gap vertical=2
+//   col x: 0, 80, 160
+//   row y: 18, 77
+#define HDR_H    18
+#define CARD_W   79
+#define CARD_H   57
 
 static int cardX(int col) { return col * (CARD_W + 1); }
 static int cardY(int row) { return HDR_H + row * (CARD_H + 2); }
@@ -231,32 +231,32 @@ void drawCard(int col, int row,
 
   // Icono
   int idx = row * 3 + col;
-  iconFns[idx](x + 12, y + 17, accentCol);
+  iconFns[idx](x + 10, y + 13, accentCol);
 
   // Etiqueta
   spr.setTextColor(C_LABEL, C_CARD);
-  spr.drawString(label, x + 27, y + 11, 1);
+  spr.drawString(label, x + 22, y + 5, 1);
 
   // Valor principal (Font 4 = 26px)
   spr.setTextColor(C_TEXT, C_CARD);
   char buf[12];
   snprintf(buf, sizeof(buf), showCompass ? "%.0f" : "%.1f", value);
-  spr.drawString(buf, x + 6, y + 27, 4);
+  spr.drawString(buf, x + 4, y + 18, 4);
 
-  // Unidad
+  // Unidad y badge en la misma fila inferior
   spr.setTextColor(C_LABEL, C_CARD);
-  spr.drawString(unit, x + 6, y + 55, 1);
+  spr.drawString(unit, x + 4, y + CARD_H - 13, 1);
 
   // Abreviatura de dirección brújula
   if (showCompass) {
     spr.setTextColor(accentCol, C_CARD);
-    spr.drawString(degToCompass(value), x + 60, y + 55, 2);
+    spr.drawString(degToCompass(value), x + 42, y + CARD_H - 13, 2);
   }
 
   // Badge REAL / SIM (esquina inferior derecha)
   const char* badge = simulated ? "[SIM]" : "[OK]";
   spr.setTextColor(accentCol, C_CARD);
-  spr.drawRightString(badge, x + CARD_W - 4, y + CARD_H - 12, 1);
+  spr.drawRightString(badge, x + CARD_W - 2, y + CARD_H - 13, 1);
 }
 
 // ── Dibujar pantalla principal ────────────────────────────────────────────────
@@ -264,24 +264,24 @@ void drawScreen() {
   spr.fillSprite(C_BG);
 
   // ── Cabecera ──
-  spr.fillRect(0, 0, 320, HDR_H, C_HDR);
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
 
   spr.setTextColor(C_TEXT, C_HDR);
-  spr.drawString("METEOSTATION", 8, 5, 2);
+  spr.drawString("METEOSTATION", 6, 4, 2);
 
   // WiFi
   if (WiFi.status() == WL_CONNECTED) {
     spr.setTextColor(C_REAL, C_HDR);
-    spr.drawString("WiFi", 220, 6, 1);
+    spr.drawString("WiFi", 168, 5, 1);
   } else {
     spr.setTextColor(C_RED, C_HDR);
-    spr.drawString("NoWiFi", 210, 6, 1);
+    spr.drawString("NoWiFi", 157, 5, 1);
   }
 
   // Círculo de estado del servidor
   uint16_t srvCol = lastServerOK ? C_REAL : C_RED;
-  spr.fillCircle(308, 11, 6, srvCol);
-  spr.drawCircle(308, 11, 6, C_TEXT);
+  spr.fillCircle(230, 9, 5, srvCol);
+  spr.drawCircle(230, 9, 5, C_TEXT);
 
   // ── 6 tarjetas ──
   //  Fila 0
@@ -301,9 +301,9 @@ void drawBootScreen(const char* wifiMsg) {
   spr.fillSprite(C_BG);
 
   // Cabecera
-  spr.fillRect(0, 0, 320, HDR_H, C_HDR);
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
   spr.setTextColor(C_TEXT, C_HDR);
-  spr.drawCentreString("METEOSTATION  v3", 160, 5, 2);
+  spr.drawCentreString("METEOSTATION  v3", 120, 4, 2);
 
   // Estado de cada sensor
   struct { const char* lbl; bool ok; } sensors[3] = {
@@ -313,19 +313,19 @@ void drawBootScreen(const char* wifiMsg) {
   };
 
   for (int i = 0; i < 3; i++) {
-    int y = 32 + i * 26;
+    int y = 26 + i * 28;
     spr.setTextColor(C_LABEL, C_BG);
-    spr.drawString(sensors[i].lbl, 20, y, 2);
+    spr.drawString(sensors[i].lbl, 8, y, 2);
 
     uint16_t badgeCol  = sensors[i].ok ? C_REAL : C_SIM;
     const char* badgeTxt = sensors[i].ok ? "  REAL  " : "  SIM  ";
-    spr.fillRoundRect(220, y, 70, 16, 3, badgeCol);
+    spr.fillRoundRect(163, y, 60, 16, 3, badgeCol);
     spr.setTextColor(TFT_BLACK, badgeCol);
-    spr.drawCentreString(badgeTxt, 255, y + 4, 1);
+    spr.drawCentreString(badgeTxt, 193, y + 4, 1);
   }
 
   spr.setTextColor(C_LABEL, C_BG);
-  spr.drawCentreString(wifiMsg, 160, 126, 2);
+  spr.drawCentreString(wifiMsg, 120, 110, 2);
 
   spr.pushSprite(0, 0);
 }
@@ -341,7 +341,7 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  spr.createSprite(320, 170);
+  spr.createSprite(240, 135);
   spr.setSwapBytes(true);
 
   // DHT — necesita tiempo antes de la primera lectura
