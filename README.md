@@ -1,123 +1,209 @@
-Estación Meteorológica Pape: Sistema de Adquisición y Transmisión de Datos Meteorológicos Basado en ESP32
----------------------------------------------------------------------------------------------------------
+# MeteoStation — Firmware ESP32
 
-Descripción
------------
+Firmware para la estación meteorológica casera. El ESP32 recoge datos de temperatura, humedad, presión y viento, los muestra en una pantalla TFT y los envía cada 20 segundos al servidor Flask por HTTP.
 
-Este proyecto implementa una estación meteorológica utilizando un microcontrolador ESP32. El sistema recopila datos de diversos sensores y los transmite a un servidor remoto para su almacenamiento y análisis.
+Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/alepape1/app_meteo)
 
-Hardware
---------
+---
 
-Componentes:
+## Índice
 
--   ESP32 DevKitC
--   Sensor de temperatura MCP9808
--   Sensor de humedad y temperatura DHT11
--   Sensor de presión barométrica (compatible con SparkFun MicroPressure)
--   Anemómetro
--   Veleta
--   Resistores
--   Breadboard
--   Cables de puente
+- [Hardware](#hardware)
+- [Conexiones](#conexiones)
+- [Librerías necesarias](#librerías-necesarias)
+- [Configuración antes de compilar](#configuración-antes-de-compilar)
+- [Arquitectura del firmware](#arquitectura-del-firmware)
+- [Algoritmos](#algoritmos)
+- [Formato de datos enviados al servidor](#formato-de-datos-enviados-al-servidor)
+- [Pantalla TFT](#pantalla-tft)
+- [Problemas conocidos](#problemas-conocidos)
 
-Diagrama de conexiones:
+---
 
-Diagrama de Conexiones: [se quitó una URL no válida]
+## Hardware
 
-Software
---------
+| Componente | Modelo | Función |
+|------------|--------|---------|
+| Microcontrolador | ESP32 DevKitC | Procesamiento y WiFi |
+| Sensor temperatura exterior | Adafruit MCP9808 | Temperatura de alta precisión (I2C) |
+| Sensor temperatura + humedad | DHT11 | Temperatura interior y humedad relativa |
+| Barómetro | SparkFun MicroPressure | Presión atmosférica (I2C) |
+| Anemómetro | Analógico | Velocidad del viento (ADC) |
+| Veleta | Analógica | Dirección del viento (ADC) |
+| Pantalla | TFT 240×135 (TFT_eSPI) | Visualización local en tiempo real |
+| LED | GPIO 2 | Indicador de envío activo |
 
--   IDE de Arduino
--   Librería Adafruit MCP9808
--   Librería SparkFun MicroPressure
--   Librería DHTesp
+---
 
-Pinout
-------
+## Conexiones
 
-| Sensor | Pin | Función |
-| ------ | --- | ------ |
-| MCP9808 | D2 | SDA (I2C) |
-| MCP9808 | D1 | SCL (I2C) |
-| DHT11 | 15 | Data |
-| Barometer | No especificado | Se requiere configuración específica según el sensor (ver biblioteca SparkFun_MicroPressure) |
-| Anemometer | 37 | ADC |
-| Vane | 36 | ADC |
+| Sensor | Pin ESP32 | Función |
+|--------|-----------|---------|
+| MCP9808 | GPIO 21 | I2C SDA |
+| MCP9808 | GPIO 22 | I2C SCL |
+| SparkFun MicroPressure | GPIO 21 | I2C SDA (bus compartido) |
+| SparkFun MicroPressure | GPIO 22 | I2C SCL (bus compartido) |
+| DHT11 | GPIO 15 | Data |
+| Anemómetro | GPIO 37 | ADC (entrada analógica) |
+| Veleta | GPIO 36 | ADC (entrada analógica) |
+| LED indicador | GPIO 2 | Salida digital |
+| Pantalla TFT | Según User_Setup.h | SPI (configurado en librería TFT_eSPI) |
 
-drive_spreadsheetExportar a Hojas de cálculo
+> El MCP9808 tiene dirección I2C `0x19`.
+> El barómetro y el MCP9808 comparten el mismo bus I2C (pines 21 y 22).
 
-Librerías
----------
+---
 
--   Adafruit MCP9808: [se quitó una URL no válida]
--   SparkFun MicroPressure: [se quitó una URL no válida]
--   DHTesp: [se quitó una URL no válida]
+## Librerías necesarias
 
-Recursos Adicionales
---------------------
+Instalar desde el gestor de librerías de Arduino IDE:
 
--   Datasheet del MCP9808: <https://www.microchip.com/en-us/product/MCP9808>
--   Datasheet del DHT11: [se quitó una URL no válida]
--   Guía de SparkFun MicroPressure: [se quitó una URL no válida]
--   Guía de DHTesp: [se quitó una URL no válida]
+| Librería | Autor |
+|----------|-------|
+| `TFT_eSPI` | Bodmer |
+| `Adafruit MCP9808 Library` | Adafruit |
+| `SparkFun MicroPressure Library` | SparkFun Electronics |
+| `DHTesp` | beegee-tokyo |
 
-Funcionamiento
---------------
+> La librería `TFT_eSPI` requiere configurar el archivo `User_Setup.h` con los pines SPI de tu pantalla antes de compilar.
 
-1.  Los sensores recopilan datos de temperatura, humedad, presión, velocidad del viento y dirección del viento.
-2.  Los datos se procesan y filtran para mejorar la precisión.
-3.  Los datos se transmiten a un servidor remoto mediante una solicitud HTTP POST.
-4.  El servidor puede almacenar, analizar y visualizar los datos.
+---
 
-Formato de Datos
-----------------
+## Configuración antes de compilar
 
-Los datos se transmiten al servidor como una cadena separada por comas (CSV) que contiene los siguientes valores:
+Edita estas líneas en el `.ino`:
 
--   Temperatura (MCP9808)
--   Presión (barómetro)
--   Temperatura (DHT11)
--   Humedad (DHT11)
--   Velocidad del viento (anemómetro)
--   Dirección del viento (grados) (veleta)
--   Velocidad del viento filtrada (anemómetro)
--   Dirección del viento filtrada (grados) (veleta)
+```cpp
+// Red WiFi
+const char* ssid       = "TU_RED_WIFI";
+const char* password   = "TU_PASSWORD";
 
-Integración con el Servidor
----------------------------
+// IP del servidor Flask (Raspberry Pi)
+const char* server_ip  = "192.168.1.42";
+const int   server_port = 5000;
+```
 
-Se requiere un script del lado del servidor (p. ej., Flask) para recibir la solicitud HTTP POST que contiene la cadena de datos meteorológicos. El script puede:
+> Las credenciales WiFi están actualmente en texto plano en el código.
+> No subas el archivo al repositorio con tus credenciales reales o usa un archivo `secrets.h` excluido del `.gitignore`.
 
--   Almacenar los datos en una base de datos.
--   Mostrar los datos en un panel.
--   Integrar los datos en un flujo de trabajo de análisis de datos.
+---
 
-Notas
------
+## Arquitectura del firmware
 
--   El pinout del barómetro no se ha especificado ya que depende del modelo utilizado. Consulte la documentación del sensor o la biblioteca SparkFun_MicroPressure para obtener la configuración específica.
--   Asegúrese de verificar las conexiones de pinout para su placa ESP32 específica, ya que pueden variar.
--   Se recomienda utilizar técnicas de manejo de errores y depuración para un sistema robusto.
+El `loop()` principal tiene **tres bloques independientes** controlados por temporizadores no bloqueantes con `millis()`. Cada uno tiene su propio intervalo y ninguno depende de los demás:
 
-Conclusión
-----------
+```
+loop()
+ ├─ Cada 100ms  → Leer anemómetro y veleta, acumular vector de viento
+ ├─ Cada 1s     → Leer DHT11, MCP9808, barómetro. Actualizar pantalla TFT
+ └─ Cada 20s    → Calcular promedio vectorial, enviar HTTP POST al servidor
+```
 
-La estación meteorológica Pape es un sistema versátil y fácil de usar para la adquisición y transmisión de datos meteorológicos. El sistema se puede personalizar para satisfacer diferentes necesidades y aplicaciones.
+Esto garantiza que la pantalla siempre se actualiza y los sensores siempre se leen, independientemente de si el servidor está disponible o no.
 
-Créditos
---------
+---
 
--   Adafruit Industries por la biblioteca Adafruit_MCP9808
--   SparkFun Electronics por la biblioteca SparkFun_MicroPressure
--   Espressif Systems por el microcontrolador ESP32
+## Algoritmos
 
-Licencia
---------
+### Velocidad del viento — Media móvil clásica
 
-Este proyecto está licenciado bajo la Licencia MIT.
+Se mantiene un buffer circular de 10 lecturas ADC del anemómetro. La velocidad filtrada es la media de esas 10 lecturas convertida a m/s.
 
-Información de contacto
------------------------
+```cpp
+#define FILTER_SIZE 10
 
--   Correo electrónico: [su dirección de correo electrónico]
+float getWindSpeed(int adcValue) {
+    float voltage = adcValue * (ADC_VOLTAGE_REFERENCE / ADC_RANGE);
+    return (voltage / ADC_VOLTAGE_REFERENCE) * 30.0; // 0-30 m/s
+}
+```
+
+### Dirección del viento — Promedio vectorial
+
+La dirección del viento es un ángulo circular. Una media aritmética simple produce resultados incorrectos cerca del norte (ejemplo: media de 350° y 10° sería 180° en vez de 0°).
+
+El firmware acumula vectores unitarios en coordenadas cartesianas durante los 20 segundos del intervalo de envío y calcula el ángulo resultante con `atan2`:
+
+```cpp
+// Cada 100ms — acumular
+void accumulateWindVector(float degrees) {
+    float rad = degrees * PI / 180.0;
+    windSumX += cos(rad);
+    windSumY += sin(rad);
+    windSampleCount++;
+}
+
+// Cada 20s — calcular y resetear
+float calculateAndResetWindVector() {
+    float avgRad = atan2(windSumY, windSumX);
+    float avgDeg = avgRad * 180.0 / PI;
+    if (avgDeg < 0) avgDeg += 360.0;
+    windSumX = windSumY = windSampleCount = 0;
+    return avgDeg;
+}
+```
+
+Esto produce un promedio matemáticamente correcto para ángulos circulares.
+
+---
+
+## Formato de datos enviados al servidor
+
+El ESP32 envía un HTTP POST a `/send_message` con cuerpo en texto plano, exactamente 8 valores separados por coma:
+
+```
+temperaturaMCP, presion, temperaturaDHT, humedad, velocidadViento, direccionViento, velocidadVientoFiltrada, direccionVientoPromediada
+```
+
+### Ejemplo
+
+```
+21.43,101.32,20.10,58.50,4.20,225.00,3.95,218.74
+```
+
+### Mapeo de campos
+
+| Posición | Variable | Sensor | Unidad | Nota |
+|----------|----------|--------|--------|------|
+| 0 | `temperatureMCP` | MCP9808 | °C | Temperatura exterior de alta precisión |
+| 1 | `pressure` | MicroPressure | KPa | Ver nota abajo |
+| 2 | `temperatureDHT` | DHT11 | °C | Temperatura interior |
+| 3 | `humidity` | DHT11 | % | Humedad relativa |
+| 4 | `windSpeed` | Anemómetro | m/s | Lectura instantánea cruda |
+| 5 | `currentWindDirDegrees` | Veleta | ° | Dirección instantánea (0-315°, pasos de 45°) |
+| 6 | `windSpeedFiltered` | Anemómetro | m/s | Media móvil de 10 muestras |
+| 7 | `finalAverageWindDir` | Veleta | ° | Promedio vectorial de 20s |
+
+> **Nota sobre la presión:** `barometer.readPressure(KPA)` devuelve kilopascales.
+> La presión atmosférica normal (1013 hPa) aparece como ~101.3 en el servidor.
+> Para corregirlo cambiar a `barometer.readPressure(PA) / 100.0` y el servidor recibirá hPa directamente.
+
+---
+
+## Pantalla TFT
+
+La pantalla se actualiza cada segundo y muestra:
+
+```
+┌─────────────────────────────┐
+│ METEOSTATION            [●] │  ← círculo verde=OK / rojo=sin servidor
+├─────────────────────────────┤
+│ T.Int:  20.5 °C             │  ← DHT11
+│ Hum:    58.2 %              │  ← DHT11
+│ Pres:   101.3 KPa           │  ← MicroPressure
+│ Viento: 4.2ms SO            │  ← velocidad filtrada + dirección instantánea
+│ T.Ext:  21.43 °C            │  ← MCP9808
+└─────────────────────────────┘
+```
+
+El círculo de estado en la esquina superior derecha se pone **verde** si el último envío al servidor fue exitoso (HTTP 200/201) o **rojo** si falló o no había WiFi.
+
+---
+
+## Problemas conocidos
+
+| Problema | Estado | Solución |
+|----------|--------|----------|
+| Presión en KPa en vez de hPa | Pendiente | Cambiar `readPressure(KPA)` por `readPressure(PA) / 100.0` |
+| Credenciales WiFi en texto plano | Pendiente | Mover a `secrets.h` y añadirlo al `.gitignore` |
+| DHT11 puede dar lecturas inestables | Conocido | El sensor puede estar dañado; valorar reemplazar por DHT22 o SHT31 |
