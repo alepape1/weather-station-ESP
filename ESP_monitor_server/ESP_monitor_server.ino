@@ -3,8 +3,6 @@
 // Simulación automática por sensor con badge REAL/SIM en pantalla
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
-#define ESP32
-
 #include "WiFi.h"
 #include <HTTPClient.h>
 #include "secrets.h"
@@ -15,6 +13,12 @@
 #include <SparkFun_MicroPressure.h>
 #include <DHTesp.h>
 #include <math.h>
+
+// ── Credenciales (definidas en secrets.h) ─────────────────────────────────────
+const char* ssid        = WIFI_SSID;
+const char* password    = WIFI_PASSWORD;
+const char* server_ip   = SERVER_IP;
+const int   server_port = SERVER_PORT;
 
 // ── Pines ──────────────────────────────────────────────────────────────────────
 #define I2C_SDA          21
