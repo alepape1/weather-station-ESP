@@ -129,8 +129,9 @@ static uint8_t tsl_read8(uint8_t reg) {
 }
 
 static uint16_t tsl_read16(uint8_t regL) {
+  // Bit 5 (0x20) = WORD mode: lee dos registros consecutivos (LOW + HIGH) en una sola transacción
   Wire.beginTransmission(TSL2584_ADDR);
-  Wire.write(TSL2584_CMD | regL);
+  Wire.write(TSL2584_CMD | 0x20 | regL);
   Wire.endTransmission();
   Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)2);
   uint16_t lo = Wire.available() ? Wire.read() : 0;
