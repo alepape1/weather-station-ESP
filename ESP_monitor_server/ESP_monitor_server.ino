@@ -154,6 +154,8 @@ float tsl_readLux() {
   uint16_t ch0 = tsl_read16(TSL2584_D0L);
   uint16_t ch1 = tsl_read16(TSL2584_D1L);
 
+  Serial.printf("[TSL] CH0=%u CH1=%u\n", ch0, ch1);  // DEBUG — quitar cuando funcione
+
   if (ch0 == 0) return 0.0f;
 
   float ratio = (float)ch1 / (float)ch0;
