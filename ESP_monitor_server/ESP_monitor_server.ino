@@ -124,7 +124,7 @@ static uint8_t tsl_read8(uint8_t reg) {
   Wire.beginTransmission(TSL2584_ADDR);
   Wire.write(TSL2584_CMD | reg);
   if (Wire.endTransmission(false) != 0) return 0;  // repeated start (ESP8266 compatible)
-  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1, true);
+  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1, (uint8_t)1);
   return Wire.available() ? Wire.read() : 0;
 }
 
