@@ -465,6 +465,20 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.println("I2C OK");
 
+  // Escaner I2C — detecta todos los dispositivos en el bus
+  Serial.println("Escaneando bus I2C...");
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  Dispositivo en 0x%02X\n", addr);
+      found++;
+    }
+    delay(2);
+  }
+  if (found == 0) Serial.println("  Ningun dispositivo encontrado");
+  else Serial.printf("  Total: %d dispositivos\n", found);
+
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LED_OFF);
 
