@@ -123,8 +123,8 @@ static bool tsl_write(uint8_t reg, uint8_t val) {
 static uint8_t tsl_read8(uint8_t reg) {
   Wire.beginTransmission(TSL2584_ADDR);
   Wire.write(TSL2584_CMD | reg);
-  Wire.endTransmission();
-  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1);
+  if (Wire.endTransmission(false) != 0) return 0;  // repeated start (ESP8266 compatible)
+  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1, true);
   return Wire.available() ? Wire.read() : 0;
 }
 
@@ -135,12 +135,17 @@ static uint16_t tsl_read16(uint8_t regL) {
   return (hi << 8) | lo;
 }
 
-// Vuelca todos los registros 0x00–0x0F por Serial (debug)
+// Vuelca registros clave por Serial (debug)
 static void tsl_dumpRegs() {
-  Serial.println("[TSL] Dump registros:");
-  for (uint8_t r = 0x00; r <= 0x0F; r++) {
-    Serial.printf("  reg 0x%02X = 0x%02X\n", r, tsl_read8(r));
+  Serial.println("[TSL] Dump registros clave:");
+  uint8_t regs[] = {0x00, 0x01, 0x06, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F};
+  const char* names[] = {"CONTROL","TIMING ","INTERRP","ID     ","D0L    ","D0H    ","D1L    ","D1H    "};
+  for (int i = 0; i < 8; i++) {
+    Serial.printf("  0x%02X (%s) = 0x%02X\n", regs[i], names[i], tsl_read8(regs[i]));
   }
+  // El ID del chip: bits [7:4] = part number
+  uint8_t id = tsl_read8(0x0A);
+  Serial.printf("  -> Part number (ID>>4): 0x%X  (0x5=TSL2561, 0xA=TSL2584)\n", id >> 4);
 }
 
 // Retorna true si el sensor responde en el bus I2C
