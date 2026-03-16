@@ -154,20 +154,26 @@ bool tsl_begin() {
   if (!light_write(LIGHT_CTRL, 0x03)) return false;  // Power ON + ALS enable
   delay(10);
 
-  // Autodetección: APDS-9930 expone su ID (0x39) en el registro 0x12
-  uint8_t apds_id = light_read8(APDS_ID_REG);
-  if (apds_id == 0x39) {
+  // Autodetección: leer ambos registros de ID y mostrarlos
+  uint8_t apds_id = light_read8(APDS_ID_REG);  // 0x12 → 0x39 o 0x30 para APDS-9930
+  uint8_t tsl_id  = light_read8(TSL_ID_REG);   // 0x0A → 0xAx para TSL2584
+  Serial.printf("[LUZ] ID@0x12=0x%02X  ID@0x0A=0x%02X\n", apds_id, tsl_id);
+
+  // APDS-9930: ID puede ser 0x39 (rev1) o 0x30 (rev0); nibble alto = 0x3
+  if ((apds_id & 0xF0) == 0x30) {
     light_is_apds = true;
-    // ATIME=0xDB → (256-219)=37 ciclos × 2.73 ms ≈ 101 ms por conversión
+    // ATIME=0xDB → 37 ciclos × 2.73 ms ≈ 101 ms por conversión
     light_write(LIGHT_TIMING, 0xDB);
-    Serial.println("[LUZ] APDS-9930 detectado");
-  } else {
+    Serial.printf("[LUZ] APDS-9930 detectado (ID=0x%02X)\n", apds_id);
+  } else if ((tsl_id & 0xF0) == 0xA0) {
     light_is_apds = false;
-    // TSL2584: TIMING=0x02 → integración 402 ms, ganancia 1×
-    light_write(LIGHT_TIMING, 0x02);
-    uint8_t tsl_id = light_read8(TSL_ID_REG);
-    Serial.printf("[LUZ] TSL258x detectado (ID=0x%02X, part=0x%X)\n",
-                  tsl_id, tsl_id >> 4);
+    light_write(LIGHT_TIMING, 0x02);  // 402 ms, ganancia 1×
+    Serial.printf("[LUZ] TSL2584 detectado (ID=0x%02X)\n", tsl_id);
+  } else {
+    // ID desconocido — probar APDS-9930 como fallback (más probable en 0x39)
+    light_is_apds = true;
+    light_write(LIGHT_TIMING, 0xDB);
+    Serial.printf("[LUZ] ID desconocido — usando registros APDS-9930 (fallback)\n");
   }
 
   delay(450);  // Esperar primera integración completa (cubre ambos casos)
