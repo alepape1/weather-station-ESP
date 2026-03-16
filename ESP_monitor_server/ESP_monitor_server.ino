@@ -371,7 +371,13 @@ void drawBootScreen(const char* wifiMsg) {
 // =============================================================================
 void setup() {
   Serial.begin(115200);
+  delay(200);  // Espera a que el Serial esté listo (importante en ESP8266)
+  Serial.println("\n\n=== MeteoStation BOOT ===");
+
+  Serial.println("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
+  Serial.println("I2C OK");
+
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LED_OFF);
 
@@ -425,10 +431,14 @@ void setup() {
   drawBootScreen("Conectando WiFi...");
 #endif
 
+  Serial.println("Conectando WiFi...");
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(500);
+#ifdef ESP8266
+    yield();  // Evita WDT reset en ESP8266
+#endif
     Serial.print(".");
     tries++;
   }
