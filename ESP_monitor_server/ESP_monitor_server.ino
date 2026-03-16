@@ -1,6 +1,6 @@
 // MeteoStation — Firmware v3
 // Compatible con ESP32 (con pantalla ST7789 240×135) y ESP8266 (sin pantalla)
-// Simulación automática por sensor con badge REAL/SIM en pantalla
+// Sensores: MCP9808, DHT11, SparkFun MicroPressure, TSL2584, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
 // ── Detección de plataforma ───────────────────────────────────────────────────
@@ -8,15 +8,12 @@
   #include <ESP8266WiFi.h>
   #include <ESP8266HTTPClient.h>
   #include <WiFiClient.h>
-  // I2C por defecto en ESP8266: SDA=D2(4), SCL=D1(5)
   #define I2C_SDA          4
   #define I2C_SCL          5
   #define DHTPIN          14   // D5
   #define ADC_VOLTAGE_REF  3.2f
   #define ADC_RANGE        1024.0f
-  #define ANEMOMETER_PIN   A0   // único ADC disponible
-  // Sin veleta (ESP8266 solo tiene 1 pin ADC)
-  // Sin pantalla TFT
+  #define ANEMOMETER_PIN   A0
 #else  // ESP32
   #include "WiFi.h"
   #include <HTTPClient.h>
@@ -27,7 +24,7 @@
   #define ADC_RANGE        4096.0f
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
-  #define HAS_DISPLAY           // pantalla TFT solo en ESP32
+  #define HAS_DISPLAY
 #endif
 
 #include <SPI.h>
@@ -48,16 +45,10 @@ const char* password    = WIFI_PASSWORD;
 const char* server_ip   = SERVER_IP;
 const int   server_port = SERVER_PORT;
 
-// ── Pines comunes ─────────────────────────────────────────────────────────────
-#ifdef ESP8266
-  const int ledPin = 2;   // LED integrado ESP8266 (activo LOW)
-  #define LED_ON  LOW
-  #define LED_OFF HIGH
-#else
-  const int ledPin = 2;
-  #define LED_ON  LOW
-  #define LED_OFF HIGH
-#endif
+// ── Pines ─────────────────────────────────────────────────────────────────────
+const int ledPin = 2;
+#define LED_ON  LOW
+#define LED_OFF HIGH
 
 // ── Intervalos ─────────────────────────────────────────────────────────────────
 #define WIND_MS    100
@@ -78,6 +69,7 @@ DHTesp                 dht;
 bool mcp_ok = false;
 bool bar_ok = false;
 bool dht_ok = false;
+bool tsl_ok = false;
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
 float  temperatureMCP    = 0;
@@ -86,13 +78,15 @@ float  humidity          = 0;
 double pressure          = 0;
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
-float  currentWindDirDeg = 0;   // siempre 0 en ESP8266 (sin veleta)
+float  currentWindDirDeg = 0;
+float  lightLevel        = 0;   // lux — TSL2584
 
 // ── Valores simulados (drift lento) ───────────────────────────────────────────
 float sim_tempMCP  = 20.5f;
 float sim_tempDHT  = 19.8f;
 float sim_humidity = 62.0f;
 float sim_pressure = 101.3f;
+float sim_light    = 300.0f;
 
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
@@ -100,10 +94,78 @@ static float driftClamp(float v, float mn, float mx, float step) {
 }
 
 void updateSimulatedValues() {
-  sim_tempMCP  = driftClamp(sim_tempMCP,  -10.0f, 45.0f, 0.05f);
-  sim_tempDHT  = driftClamp(sim_tempDHT,  -10.0f, 45.0f, 0.05f);
-  sim_humidity = driftClamp(sim_humidity,  20.0f, 95.0f, 0.20f);
-  sim_pressure = driftClamp(sim_pressure,  95.0f,110.0f, 0.02f);
+  sim_tempMCP  = driftClamp(sim_tempMCP,  -10.0f,  45.0f,  0.05f);
+  sim_tempDHT  = driftClamp(sim_tempDHT,  -10.0f,  45.0f,  0.05f);
+  sim_humidity = driftClamp(sim_humidity,  20.0f,  95.0f,  0.20f);
+  sim_pressure = driftClamp(sim_pressure,  95.0f, 110.0f,  0.02f);
+  sim_light    = driftClamp(sim_light,      0.0f, 2000.0f, 5.0f);
+}
+
+// =============================================================================
+// TSL2584 — Sensor de luz ambiente (I2C directo, sin librería externa)
+// =============================================================================
+#define TSL2584_ADDR   0x39
+#define TSL2584_CMD    0x80
+#define TSL2584_CTRL   0x00   // POWER
+#define TSL2584_TIMING 0x01   // Integración y ganancia
+#define TSL2584_D0L    0x0C   // CH0 low  (visible + IR)
+#define TSL2584_D0H    0x0D   // CH0 high
+#define TSL2584_D1L    0x0E   // CH1 low  (IR)
+#define TSL2584_D1H    0x0F   // CH1 high
+
+static bool tsl_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(TSL2584_ADDR);
+  Wire.write(TSL2584_CMD | reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static uint8_t tsl_read8(uint8_t reg) {
+  Wire.beginTransmission(TSL2584_ADDR);
+  Wire.write(TSL2584_CMD | reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0;
+}
+
+static uint16_t tsl_read16(uint8_t regL) {
+  Wire.beginTransmission(TSL2584_ADDR);
+  Wire.write(TSL2584_CMD | regL);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)2);
+  uint16_t lo = Wire.available() ? Wire.read() : 0;
+  uint16_t hi = Wire.available() ? Wire.read() : 0;
+  return (hi << 8) | lo;
+}
+
+// Retorna true si el sensor responde en el bus I2C
+bool tsl_begin() {
+  if (!tsl_write(TSL2584_CTRL, 0x03)) return false;  // Power ON
+  delay(5);
+  // Integración 402ms, ganancia 1×
+  tsl_write(TSL2584_TIMING, 0x02);
+  delay(450);  // Esperar primera integración completa
+  return true;
+}
+
+// Calcula lux a partir de CH0 (visible+IR) y CH1 (IR)
+// Fórmula TSL258x para integración 402ms, ganancia 1×
+float tsl_readLux() {
+  uint16_t ch0 = tsl_read16(TSL2584_D0L);
+  uint16_t ch1 = tsl_read16(TSL2584_D1L);
+
+  if (ch0 == 0) return 0.0f;
+
+  float ratio = (float)ch1 / (float)ch0;
+  float lux;
+
+  if      (ratio <= 0.52f) lux = 0.0315f * ch0 - 0.0593f * ch0 * pow(ratio, 1.4f);
+  else if (ratio <= 0.65f) lux = 0.0229f * ch0 - 0.0291f * ch1;
+  else if (ratio <= 0.80f) lux = 0.0157f * ch0 - 0.0180f * ch1;
+  else if (ratio <= 1.30f) lux = 0.00338f * ch0 - 0.00260f * ch1;
+  else                     lux = 0.0f;
+
+  return max(0.0f, lux);
 }
 
 // ── Filtro media móvil (velocidad viento) ──────────────────────────────────────
@@ -137,7 +199,6 @@ float adcToWindDeg(int adc) {
   return 315.0f;
 }
 #else
-// En ESP8266 no hay veleta: se devuelve siempre 0
 float adcToWindDeg(int) { return 0.0f; }
 #endif
 
@@ -172,7 +233,7 @@ bool lastServerOK    = false;
 unsigned long lastSendTime   = 0;
 unsigned long lastScreenTime = 0;
 
-// ── HTTP helper (API diferente entre plataformas) ─────────────────────────────
+// ── HTTP helper ───────────────────────────────────────────────────────────────
 bool httpPost(const String& url, const String& body) {
   HTTPClient http;
   http.setTimeout(3000);
@@ -189,11 +250,10 @@ bool httpPost(const String& url, const String& body) {
 }
 
 // =============================================================================
-// PANTALLA TFT (solo ESP32 con HAS_DISPLAY)
+// PANTALLA TFT (solo ESP32)
 // =============================================================================
 #ifdef HAS_DISPLAY
 
-// ── Paleta de colores RGB565 ──────────────────────────────────────────────────
 #define C_BG      0x0841
 #define C_CARD    0x1082
 #define C_HDR     0x0421
@@ -204,12 +264,9 @@ bool httpPost(const String& url, const String& body) {
 #define C_REAL    0x07E0
 #define C_RED     0xF800
 
-// ── Layout (240×135) ──────────────────────────────────────────────────────────
-// Cabecera: y=0..17 (18px)
-// 2 filas × 3 columnas
-// CARD_W=79, CARD_H=57, gap horizontal=1, gap vertical=2
-//   col x: 0, 80, 160
-//   row y: 18, 77
+// Layout 240×135 — 2 filas × 3 cols + fila extra para luz
+// Fila 0-1: misma cuadrícula 2×3 de siempre (tarjetas 79×57)
+// La luz se muestra como barra inferior de 16px en la cabecera (valor en header)
 #define HDR_H    18
 #define CARD_W   79
 #define CARD_H   57
@@ -217,7 +274,6 @@ bool httpPost(const String& url, const String& body) {
 static int cardX(int col) { return col * (CARD_W + 1); }
 static int cardY(int row) { return HDR_H + row * (CARD_H + 2); }
 
-// ── Iconos ────────────────────────────────────────────────────────────────────
 void iconThermometer(int cx, int cy, uint16_t col) {
   spr.fillRoundRect(cx - 2, cy - 7, 5, 10, 2, col);
   spr.fillCircle(cx, cy + 5, 4, col);
@@ -252,6 +308,19 @@ void iconCompass(int cx, int cy, uint16_t col) {
   spr.fillTriangle(cx, cy + 6, cx - 2, cy, cx + 2, cy, C_LABEL);
 }
 
+// Icono sol simple para luz
+void iconSun(int cx, int cy, uint16_t col) {
+  spr.fillCircle(cx, cy, 4, col);
+  for (int a = 0; a < 360; a += 45) {
+    float r = a * PI / 180.0f;
+    int x1 = cx + (int)(6 * cos(r));
+    int y1 = cy + (int)(6 * sin(r));
+    int x2 = cx + (int)(9 * cos(r));
+    int y2 = cy + (int)(9 * sin(r));
+    spr.drawLine(x1, y1, x2, y2, col);
+  }
+}
+
 typedef void (*IconFn)(int, int, uint16_t);
 IconFn iconFns[6] = {
   iconThermometer,
@@ -262,13 +331,11 @@ IconFn iconFns[6] = {
   iconCompass,
 };
 
-// ── Dibujar tarjeta ───────────────────────────────────────────────────────────
 void drawCard(int col, int row,
               const char* label,
               float value, const char* unit,
               bool simulated,
               bool showCompass = false) {
-
   int x = cardX(col);
   int y = cardY(row);
 
@@ -302,13 +369,21 @@ void drawCard(int col, int row,
   spr.drawRightString(badge, x + CARD_W - 2, y + CARD_H - 13, 1);
 }
 
-// ── Dibujar pantalla principal ────────────────────────────────────────────────
 void drawScreen() {
   spr.fillSprite(C_BG);
 
+  // Cabecera con luz integrada a la derecha del título
   spr.fillRect(0, 0, 240, HDR_H, C_HDR);
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawString("METEOSTATION", 6, 4, 2);
+
+  // Luz en la cabecera (icono + valor lux)
+  uint16_t luxCol = tsl_ok ? C_REAL : C_SIM;
+  iconSun(118, 9, luxCol);
+  char luxBuf[10];
+  snprintf(luxBuf, sizeof(luxBuf), "%.0flx", lightLevel);
+  spr.setTextColor(luxCol, C_HDR);
+  spr.drawString(luxBuf, 130, 5, 1);
 
   if (WiFi.status() == WL_CONNECTED) {
     spr.setTextColor(C_REAL, C_HDR);
@@ -332,7 +407,6 @@ void drawScreen() {
   spr.pushSprite(0, 0);
 }
 
-// ── Pantalla de arranque ───────────────────────────────────────────────────────
 void drawBootScreen(const char* wifiMsg) {
   spr.fillSprite(C_BG);
 
@@ -340,14 +414,15 @@ void drawBootScreen(const char* wifiMsg) {
   spr.setTextColor(C_TEXT, C_HDR);
   spr.drawCentreString("METEOSTATION  v3", 120, 4, 2);
 
-  struct { const char* lbl; bool ok; } sensors[3] = {
+  struct { const char* lbl; bool ok; } sensors[4] = {
     { "MCP9808  (T.Ext)", mcp_ok },
     { "Barometro       ", bar_ok },
     { "DHT11    (T.Int)", dht_ok },
+    { "TSL2584  (Luz)  ", tsl_ok },
   };
 
-  for (int i = 0; i < 3; i++) {
-    int y = 26 + i * 28;
+  for (int i = 0; i < 4; i++) {
+    int y = 22 + i * 24;
     spr.setTextColor(C_LABEL, C_BG);
     spr.drawString(sensors[i].lbl, 8, y, 2);
 
@@ -359,7 +434,7 @@ void drawBootScreen(const char* wifiMsg) {
   }
 
   spr.setTextColor(C_LABEL, C_BG);
-  spr.drawCentreString(wifiMsg, 120, 110, 2);
+  spr.drawCentreString(wifiMsg, 120, 120, 2);
 
   spr.pushSprite(0, 0);
 }
@@ -371,7 +446,7 @@ void drawBootScreen(const char* wifiMsg) {
 // =============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(200);  // Espera a que el Serial esté listo (importante en ESP8266)
+  delay(200);
   Serial.println("\n\n=== MeteoStation BOOT ===");
 
   Serial.println("Iniciando I2C...");
@@ -421,6 +496,16 @@ void setup() {
     humidity       = sim_humidity;
   }
 
+  // TSL2584 — el begin() ya espera la primera integración (450ms)
+  tsl_ok = tsl_begin();
+  if (tsl_ok) {
+    Serial.println("TSL2584 OK");
+    lightLevel = tsl_readLux();
+  } else {
+    Serial.println("TSL2584 no detectado — modo simulacion");
+    lightLevel = sim_light;
+  }
+
 #ifdef ESP8266
   Serial.println("Plataforma: ESP8266 (sin pantalla, sin veleta)");
 #else
@@ -437,7 +522,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(500);
 #ifdef ESP8266
-    yield();  // Evita WDT reset en ESP8266
+    yield();
 #endif
     Serial.print(".");
     tries++;
@@ -480,16 +565,17 @@ void loop() {
     int rawVane       = analogRead(VANE_PIN);
     currentWindDirDeg = adcToWindDeg(rawVane);
 #else
-    currentWindDirDeg = 0.0f;  // sin veleta en ESP8266
+    currentWindDirDeg = 0.0f;
 #endif
 
     accumulateWindVector(currentWindDirDeg);
     lastWindRead = now;
   }
 
-  // ── 2. Sensores I2C + DHT + pantalla (cada 1s) ──────────────────────────────
+  // ── 2. Sensores I2C + DHT + TSL2584 + pantalla (cada 1s) ────────────────────
   if (now - lastScreenTime >= SCREEN_MS) {
 
+    // MCP9808
     if (mcp_ok) {
       tempsensor.wake();
       float t = tempsensor.readTempC();
@@ -503,6 +589,7 @@ void loop() {
     }
     if (!mcp_ok) temperatureMCP = sim_tempMCP;
 
+    // Barómetro
     if (bar_ok) {
       double p = barometer.readPressure(KPA);
       if (p > 50.0) {
@@ -514,6 +601,7 @@ void loop() {
     }
     if (!bar_ok) pressure = sim_pressure;
 
+    // DHT11
     TempAndHumidity th = dht.getTempAndHumidity();
     if (dht.getStatus() == DHTesp::ERROR_NONE) {
       dht_ok         = true;
@@ -525,15 +613,26 @@ void loop() {
       humidity       = sim_humidity;
     }
 
+    // TSL2584
+    if (tsl_ok) {
+      float lux = tsl_readLux();
+      if (lux >= 0.0f) {
+        lightLevel = lux;
+      } else {
+        tsl_ok = false;
+        Serial.println("TSL2584 fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!tsl_ok) lightLevel = sim_light;
+
     updateSimulatedValues();
 
 #ifdef HAS_DISPLAY
     drawScreen();
 #else
-    // Log por Serial en ESP8266
-    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f P:%.2f W:%.2f D:%.0f\n",
+    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f\n",
       temperatureMCP, temperatureDHT, humidity,
-      (float)pressure, windSpeedFiltered, currentWindDirDeg);
+      (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel);
 #endif
 
     lastScreenTime = now;
@@ -548,6 +647,8 @@ void loop() {
       digitalWrite(ledPin, LED_ON);
 
       String url = "http://" + String(server_ip) + ":" + String(server_port) + "/send_message";
+      // CSV: 9 valores — temperatura, presion, temp_bar, humedad,
+      //                   viento, direccion, viento_filtrado, dir_filtrada, luz
       String msg = String(temperatureMCP, 2)    + "," +
                    String(pressure, 2)          + "," +
                    String(temperatureDHT, 2)    + "," +
@@ -555,7 +656,8 @@ void loop() {
                    String(windSpeed, 2)         + "," +
                    String(currentWindDirDeg, 2) + "," +
                    String(windSpeedFiltered, 2) + "," +
-                   String(finalAvgWindDir, 2);
+                   String(finalAvgWindDir, 2)   + "," +
+                   String(lightLevel, 2);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
