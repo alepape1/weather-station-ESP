@@ -129,14 +129,18 @@ static uint8_t tsl_read8(uint8_t reg) {
 }
 
 static uint16_t tsl_read16(uint8_t regL) {
-  // Bit 5 (0x20) = WORD mode: lee dos registros consecutivos (LOW + HIGH) en una sola transacción
-  Wire.beginTransmission(TSL2584_ADDR);
-  Wire.write(TSL2584_CMD | 0x20 | regL);
-  Wire.endTransmission();
-  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)2);
-  uint16_t lo = Wire.available() ? Wire.read() : 0;
-  uint16_t hi = Wire.available() ? Wire.read() : 0;
+  // Dos lecturas separadas — más compatible con ESP8266
+  uint16_t lo = tsl_read8(regL);
+  uint16_t hi = tsl_read8(regL + 1);
   return (hi << 8) | lo;
+}
+
+// Vuelca todos los registros 0x00–0x0F por Serial (debug)
+static void tsl_dumpRegs() {
+  Serial.println("[TSL] Dump registros:");
+  for (uint8_t r = 0x00; r <= 0x0F; r++) {
+    Serial.printf("  reg 0x%02X = 0x%02X\n", r, tsl_read8(r));
+  }
 }
 
 // Retorna true si el sensor responde en el bus I2C
@@ -503,6 +507,7 @@ void setup() {
   tsl_ok = tsl_begin();
   if (tsl_ok) {
     Serial.println("TSL2584 OK");
+    tsl_dumpRegs();   // DEBUG — quitar cuando funcione
     lightLevel = tsl_readLux();
   } else {
     Serial.println("TSL2584 no detectado — modo simulacion");
