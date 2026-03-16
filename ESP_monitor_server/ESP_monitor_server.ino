@@ -102,69 +102,89 @@ void updateSimulatedValues() {
 }
 
 // =============================================================================
-// TSL2584 — Sensor de luz ambiente (I2C directo, sin librería externa)
+// Sensor de luz ambiente — autodetección TSL2584 / APDS-9930 (I2C directo)
+// Ambos chips usan dirección 0x39 y protocolo CMD=0x80|reg.
+// TSL2584:  datos en 0x0C-0x0F, ID en 0x0A (bits[7:4]=0xA)
+// APDS-9930: datos en 0x14-0x17, ID en 0x12 (=0x39)
 // =============================================================================
-#define TSL2584_ADDR   0x39
-#define TSL2584_CMD    0x80
-#define TSL2584_CTRL   0x00   // POWER
-#define TSL2584_TIMING 0x01   // Integración y ganancia
-#define TSL2584_D0L    0x0C   // CH0 low  (visible + IR)
-#define TSL2584_D0H    0x0D   // CH0 high
-#define TSL2584_D1L    0x0E   // CH1 low  (IR)
-#define TSL2584_D1H    0x0F   // CH1 high
+#define LIGHT_ADDR     0x39
+#define LIGHT_CMD      0x80   // bit CMD obligatorio en el byte de registro
 
-static bool tsl_write(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(TSL2584_ADDR);
-  Wire.write(TSL2584_CMD | reg);
+// Registros comunes (misma dirección en ambos chips)
+#define LIGHT_CTRL     0x00   // ENABLE / POWER
+#define LIGHT_TIMING   0x01   // TIMING (TSL) / ATIME (APDS)
+
+// Registros exclusivos TSL2584
+#define TSL_ID_REG     0x0A   // Part number en bits[7:4]; TSL2584 = 0xA
+#define TSL_D0L        0x0C   // CH0 low  (visible + IR)
+#define TSL_D1L        0x0E   // CH1 low  (IR)
+
+// Registros exclusivos APDS-9930
+#define APDS_ID_REG    0x12   // Chip ID; APDS-9930 = 0x39
+#define APDS_CDATAL    0x14   // Clear channel low  (visible + IR)
+#define APDS_IRDATAL   0x16   // IR channel low
+
+static bool light_is_apds = false;  // se establece en tsl_begin()
+
+static bool light_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(LIGHT_ADDR);
+  Wire.write(LIGHT_CMD | reg);
   Wire.write(val);
   return Wire.endTransmission() == 0;
 }
 
-static uint8_t tsl_read8(uint8_t reg) {
-  Wire.beginTransmission(TSL2584_ADDR);
-  Wire.write(TSL2584_CMD | reg);
-  if (Wire.endTransmission(false) != 0) return 0;  // repeated start (ESP8266 compatible)
-  Wire.requestFrom((uint8_t)TSL2584_ADDR, (uint8_t)1, (uint8_t)1);
-  return Wire.available() ? Wire.read() : 0;
+// Lectura stop-start (más compatible con ESP8266 que repeated-start)
+static uint8_t light_read8(uint8_t reg) {
+  Wire.beginTransmission(LIGHT_ADDR);
+  Wire.write(LIGHT_CMD | reg);
+  if (Wire.endTransmission() != 0) return 0xFF;
+  Wire.requestFrom((uint8_t)LIGHT_ADDR, (uint8_t)1, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
 }
 
-static uint16_t tsl_read16(uint8_t regL) {
-  // Dos lecturas separadas — más compatible con ESP8266
-  uint16_t lo = tsl_read8(regL);
-  uint16_t hi = tsl_read8(regL + 1);
+static uint16_t light_read16(uint8_t regL) {
+  uint16_t lo = light_read8(regL);
+  uint16_t hi = light_read8(regL + 1);
   return (hi << 8) | lo;
 }
 
-// Vuelca registros clave por Serial (debug)
-static void tsl_dumpRegs() {
-  Serial.println("[TSL] Dump registros clave:");
-  uint8_t regs[] = {0x00, 0x01, 0x06, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F};
-  const char* names[] = {"CONTROL","TIMING ","INTERRP","ID     ","D0L    ","D0H    ","D1L    ","D1H    "};
-  for (int i = 0; i < 8; i++) {
-    Serial.printf("  0x%02X (%s) = 0x%02X\n", regs[i], names[i], tsl_read8(regs[i]));
-  }
-  // El ID del chip: bits [7:4] = part number
-  uint8_t id = tsl_read8(0x0A);
-  Serial.printf("  -> Part number (ID>>4): 0x%X  (0x5=TSL2561, 0xA=TSL2584)\n", id >> 4);
-}
-
-// Retorna true si el sensor responde en el bus I2C
+// Enciende el sensor, detecta el tipo y configura la integración.
+// Devuelve true si el sensor responde en el bus.
 bool tsl_begin() {
-  if (!tsl_write(TSL2584_CTRL, 0x03)) return false;  // Power ON
-  delay(5);
-  // Integración 402ms, ganancia 1×
-  tsl_write(TSL2584_TIMING, 0x02);
-  delay(450);  // Esperar primera integración completa
+  if (!light_write(LIGHT_CTRL, 0x03)) return false;  // Power ON + ALS enable
+  delay(10);
+
+  // Autodetección: APDS-9930 expone su ID (0x39) en el registro 0x12
+  uint8_t apds_id = light_read8(APDS_ID_REG);
+  if (apds_id == 0x39) {
+    light_is_apds = true;
+    // ATIME=0xDB → (256-219)=37 ciclos × 2.73 ms ≈ 101 ms por conversión
+    light_write(LIGHT_TIMING, 0xDB);
+    Serial.println("[LUZ] APDS-9930 detectado");
+  } else {
+    light_is_apds = false;
+    // TSL2584: TIMING=0x02 → integración 402 ms, ganancia 1×
+    light_write(LIGHT_TIMING, 0x02);
+    uint8_t tsl_id = light_read8(TSL_ID_REG);
+    Serial.printf("[LUZ] TSL258x detectado (ID=0x%02X, part=0x%X)\n",
+                  tsl_id, tsl_id >> 4);
+  }
+
+  delay(450);  // Esperar primera integración completa (cubre ambos casos)
   return true;
 }
 
-// Calcula lux a partir de CH0 (visible+IR) y CH1 (IR)
-// Fórmula TSL258x para integración 402ms, ganancia 1×
+// Devuelve lux estimado a partir del canal visible+IR y el canal IR.
+// Usa la fórmula TSL258x (válida también como aproximación para APDS-9930).
 float tsl_readLux() {
-  uint16_t ch0 = tsl_read16(TSL2584_D0L);
-  uint16_t ch1 = tsl_read16(TSL2584_D1L);
-
-  Serial.printf("[TSL] CH0=%u CH1=%u\n", ch0, ch1);  // DEBUG — quitar cuando funcione
+  uint16_t ch0, ch1;
+  if (light_is_apds) {
+    ch0 = light_read16(APDS_CDATAL);   // clear (visible + IR)
+    ch1 = light_read16(APDS_IRDATAL);  // IR
+  } else {
+    ch0 = light_read16(TSL_D0L);
+    ch1 = light_read16(TSL_D1L);
+  }
 
   if (ch0 == 0) return 0.0f;
 
@@ -430,7 +450,7 @@ void drawBootScreen(const char* wifiMsg) {
     { "MCP9808  (T.Ext)", mcp_ok },
     { "Barometro       ", bar_ok },
     { "DHT11    (T.Int)", dht_ok },
-    { "TSL2584  (Luz)  ", tsl_ok },
+    { "LuzAmb   (0x39) ", tsl_ok },
   };
 
   for (int i = 0; i < 4; i++) {
@@ -525,11 +545,10 @@ void setup() {
   // TSL2584 — el begin() ya espera la primera integración (450ms)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
-    Serial.println("TSL2584 OK");
-    tsl_dumpRegs();   // DEBUG — quitar cuando funcione
+    Serial.println("Sensor luz OK");
     lightLevel = tsl_readLux();
   } else {
-    Serial.println("TSL2584 no detectado — modo simulacion");
+    Serial.println("Sensor luz no detectado — modo simulacion");
     lightLevel = sim_light;
   }
 
