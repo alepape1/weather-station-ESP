@@ -1,6 +1,6 @@
 // MeteoStation — Firmware v3
 // Compatible con ESP32 (con pantalla ST7789 240×135) y ESP8266 (sin pantalla)
-// Sensores: MCP9808, DHT11, SparkFun MicroPressure, TSL2584, anemómetro, veleta
+// Sensores: MCP9808, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
 // ── Detección de plataforma ───────────────────────────────────────────────────
@@ -10,7 +10,6 @@
   #include <WiFiClient.h>
   #define I2C_SDA          4
   #define I2C_SCL          5
-  #define DHTPIN          14   // D5
   #define ADC_VOLTAGE_REF  3.2f
   #define ADC_RANGE        1024.0f
   #define ANEMOMETER_PIN   A0
@@ -19,7 +18,6 @@
   #include <HTTPClient.h>
   #define I2C_SDA          21
   #define I2C_SCL          22
-  #define DHTPIN           15
   #define ADC_VOLTAGE_REF  3.41f
   #define ADC_RANGE        4096.0f
   #define ANEMOMETER_PIN   37
@@ -31,7 +29,6 @@
 #include <Wire.h>
 #include <Adafruit_MCP9808.h>
 #include <SparkFun_MicroPressure.h>
-#include <DHTesp.h>
 #include <math.h>
 #include "secrets.h"
 
@@ -58,7 +55,6 @@ const int ledPin = 2;
 // ── Objetos ────────────────────────────────────────────────────────────────────
 SparkFun_MicroPressure barometer;
 Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
-DHTesp                 dht;
 
 #ifdef HAS_DISPLAY
   TFT_eSPI    tft = TFT_eSPI();
@@ -68,7 +64,7 @@ DHTesp                 dht;
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
 bool bar_ok = false;
-bool dht_ok = false;
+bool htu_ok = false;
 bool tsl_ok = false;
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
@@ -99,6 +95,49 @@ void updateSimulatedValues() {
   sim_humidity = driftClamp(sim_humidity,  20.0f,  95.0f,  0.20f);
   sim_pressure = driftClamp(sim_pressure,  95.0f, 110.0f,  0.02f);
   sim_light    = driftClamp(sim_light,      0.0f, 2000.0f, 5.0f);
+}
+
+// =============================================================================
+// HTU2x (HTU21D / HTU20D / SHT21) — temperatura y humedad por I2C
+// Dirección fija: 0x40. Sin librería externa.
+// =============================================================================
+#define HTU2X_ADDR        0x40
+#define HTU2X_CMD_TEMP    0xF3   // medir temperatura, no-hold master
+#define HTU2X_CMD_HUM     0xF5   // medir humedad,     no-hold master
+#define HTU2X_CMD_RESET   0xFE
+
+bool htu_begin() {
+  Wire.beginTransmission(HTU2X_ADDR);
+  Wire.write(HTU2X_CMD_RESET);
+  if (Wire.endTransmission() != 0) return false;
+  delay(15);  // tiempo de reset (máx 15 ms según datasheet)
+  return true;
+}
+
+// Lanza una medición y espera. Devuelve NAN si falla.
+static float htu_measure(uint8_t cmd, uint16_t wait_ms) {
+  Wire.beginTransmission(HTU2X_ADDR);
+  Wire.write(cmd);
+  if (Wire.endTransmission() != 0) return NAN;
+  delay(wait_ms);
+  Wire.requestFrom((uint8_t)HTU2X_ADDR, (uint8_t)3, (uint8_t)1);
+  if (Wire.available() < 2) return NAN;
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+  if (Wire.available()) Wire.read();  // descarta CRC
+  raw &= 0xFFFC;  // limpia los 2 bits de tipo de medición
+  return (float)raw;
+}
+
+float htu_readTemp() {
+  float raw = htu_measure(HTU2X_CMD_TEMP, 50);
+  if (isnan(raw)) return NAN;
+  return -46.85f + 175.72f * (raw / 65536.0f);
+}
+
+float htu_readHumidity() {
+  float raw = htu_measure(HTU2X_CMD_HUM, 20);
+  if (isnan(raw)) return NAN;
+  return constrain(-6.0f + 125.0f * (raw / 65536.0f), 0.0f, 100.0f);
 }
 
 // =============================================================================
@@ -436,8 +475,8 @@ void drawScreen() {
   spr.drawCircle(230, 9, 5, C_TEXT);
 
   drawCard(0, 0, "T.EXT",   temperatureMCP,     "C",    !mcp_ok);
-  drawCard(1, 0, "T.INT",   temperatureDHT,     "C",    !dht_ok);
-  drawCard(2, 0, "HUMEDAD", humidity,           "%",    !dht_ok);
+  drawCard(1, 0, "T.INT",   temperatureDHT,     "C",    !htu_ok);
+  drawCard(2, 0, "HUMEDAD", humidity,           "%",    !htu_ok);
   drawCard(0, 1, "PRESION", (float)pressure,    "KPa",  !bar_ok);
   drawCard(1, 1, "VIENTO",  windSpeedFiltered,  "m/s",  false);
   drawCard(2, 1, "DIRECC.", currentWindDirDeg,  "deg",  false, true);
@@ -455,7 +494,7 @@ void drawBootScreen(const char* wifiMsg) {
   struct { const char* lbl; bool ok; } sensors[4] = {
     { "MCP9808  (T.Ext)", mcp_ok },
     { "Barometro       ", bar_ok },
-    { "DHT11    (T.Int)", dht_ok },
+    { "HTU2x    (T+H)  ", htu_ok },
     { "LuzAmb   (0x39) ", tsl_ok },
   };
 
@@ -516,8 +555,6 @@ void setup() {
   spr.setSwapBytes(true);
 #endif
 
-  dht.setup(DHTPIN, DHTesp::DHT11);
-
   mcp_ok = tempsensor.begin(0x19);
   if (mcp_ok) {
     tempsensor.setResolution(3);
@@ -535,15 +572,20 @@ void setup() {
     pressure = sim_pressure;
   }
 
-  delay(dht.getMinimumSamplingPeriod());
-  TempAndHumidity th = dht.getTempAndHumidity();
-  dht_ok = (dht.getStatus() == DHTesp::ERROR_NONE);
-  if (dht_ok) {
-    Serial.println("DHT11 OK");
-    temperatureDHT = th.temperature;
-    humidity       = th.humidity;
-  } else {
-    Serial.println("DHT11 no detectado — modo simulacion");
+  htu_ok = htu_begin();
+  if (htu_ok) {
+    float t = htu_readTemp();
+    float h = htu_readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      temperatureDHT = t;
+      humidity       = h;
+      Serial.println("HTU2x OK");
+    } else {
+      htu_ok = false;
+    }
+  }
+  if (!htu_ok) {
+    Serial.println("HTU2x no detectado — modo simulacion");
     temperatureDHT = sim_tempDHT;
     humidity       = sim_humidity;
   }
@@ -624,7 +666,7 @@ void loop() {
     lastWindRead = now;
   }
 
-  // ── 2. Sensores I2C + DHT + TSL2584 + pantalla (cada 1s) ────────────────────
+  // ── 2. Sensores I2C (MCP9808, HTU2x, barometro, luz) + pantalla (cada 1s) ───
   if (now - lastScreenTime >= SCREEN_MS) {
 
     // MCP9808
@@ -653,14 +695,19 @@ void loop() {
     }
     if (!bar_ok) pressure = sim_pressure;
 
-    // DHT11
-    TempAndHumidity th = dht.getTempAndHumidity();
-    if (dht.getStatus() == DHTesp::ERROR_NONE) {
-      dht_ok         = true;
-      temperatureDHT = th.temperature;
-      humidity       = th.humidity;
-    } else {
-      dht_ok         = false;
+    // HTU2x
+    if (htu_ok) {
+      float t = htu_readTemp();
+      float h = htu_readHumidity();
+      if (!isnan(t) && !isnan(h)) {
+        temperatureDHT = t;
+        humidity       = h;
+      } else {
+        htu_ok = false;
+        Serial.println("HTU2x fallo en lectura — cambiando a simulacion");
+      }
+    }
+    if (!htu_ok) {
       temperatureDHT = sim_tempDHT;
       humidity       = sim_humidity;
     }
