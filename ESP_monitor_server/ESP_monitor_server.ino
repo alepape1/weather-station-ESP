@@ -11,6 +11,7 @@
   #include <ArduinoOTA.h>
   #define I2C_SDA          4
   #define I2C_SCL          5
+  #define DHTPIN          14   // D5
   #define ADC_VOLTAGE_REF  3.2f
   #define ADC_RANGE        1024.0f
   #define ANEMOMETER_PIN   A0
@@ -20,6 +21,7 @@
   #include <ArduinoOTA.h>
   #define I2C_SDA          21
   #define I2C_SCL          22
+  #define DHTPIN           15
   #define ADC_VOLTAGE_REF  3.41f
   #define ADC_RANGE        4096.0f
   #define ANEMOMETER_PIN   37
@@ -31,6 +33,7 @@
 #include <Wire.h>
 #include <Adafruit_MCP9808.h>
 #include <SparkFun_MicroPressure.h>
+#include <DHTesp.h>
 #include <math.h>
 #include "secrets.h"
 
@@ -57,6 +60,7 @@ const int ledPin = 2;
 // ── Objetos ────────────────────────────────────────────────────────────────────
 SparkFun_MicroPressure barometer;
 Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
+DHTesp                 dht;
 
 #ifdef HAS_DISPLAY
   TFT_eSPI    tft = TFT_eSPI();
@@ -67,24 +71,29 @@ Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
 bool mcp_ok = false;
 bool bar_ok = false;
 bool htu_ok = false;
+bool dht_ok = false;
 bool tsl_ok = false;
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
 float  temperatureMCP    = 0;
-float  temperatureDHT    = 0;
-float  humidity          = 0;
+float  temperatureDHT    = 0;   // HTU2x temperatura
+float  humidity          = 0;   // HTU2x humedad
+float  temperatureDHT11  = 0;   // DHT11 temperatura
+float  humidityDHT11     = 0;   // DHT11 humedad
 double pressure          = 0;
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
-float  lightLevel        = 0;   // lux — TSL2584
+float  lightLevel        = 0;
 
 // ── Valores simulados (drift lento) ───────────────────────────────────────────
-float sim_tempMCP  = 20.5f;
-float sim_tempDHT  = 19.8f;
-float sim_humidity = 62.0f;
-float sim_pressure = 101.3f;
-float sim_light    = 300.0f;
+float sim_tempMCP   = 20.5f;
+float sim_tempDHT   = 19.8f;
+float sim_humidity  = 62.0f;
+float sim_tempDHT11 = 20.1f;
+float sim_humDHT11  = 60.0f;
+float sim_pressure  = 101.3f;
+float sim_light     = 300.0f;
 
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
@@ -92,11 +101,13 @@ static float driftClamp(float v, float mn, float mx, float step) {
 }
 
 void updateSimulatedValues() {
-  sim_tempMCP  = driftClamp(sim_tempMCP,  -10.0f,  45.0f,  0.05f);
-  sim_tempDHT  = driftClamp(sim_tempDHT,  -10.0f,  45.0f,  0.05f);
-  sim_humidity = driftClamp(sim_humidity,  20.0f,  95.0f,  0.20f);
-  sim_pressure = driftClamp(sim_pressure,  95.0f, 110.0f,  0.02f);
-  sim_light    = driftClamp(sim_light,      0.0f, 2000.0f, 5.0f);
+  sim_tempMCP   = driftClamp(sim_tempMCP,   -10.0f,  45.0f,  0.05f);
+  sim_tempDHT   = driftClamp(sim_tempDHT,   -10.0f,  45.0f,  0.05f);
+  sim_humidity  = driftClamp(sim_humidity,   20.0f,  95.0f,  0.20f);
+  sim_tempDHT11 = driftClamp(sim_tempDHT11, -10.0f,  45.0f,  0.05f);
+  sim_humDHT11  = driftClamp(sim_humDHT11,   20.0f,  95.0f,  0.20f);
+  sim_pressure  = driftClamp(sim_pressure,   95.0f, 110.0f,  0.02f);
+  sim_light     = driftClamp(sim_light,       0.0f, 2000.0f, 5.0f);
 }
 
 // =============================================================================
@@ -592,6 +603,23 @@ void setup() {
     humidity       = sim_humidity;
   }
 
+  // DHT11
+  dht.setup(DHTPIN, DHTesp::DHT11);
+  delay(dht.getMinimumSamplingPeriod());
+  {
+    TempAndHumidity th = dht.getTempAndHumidity();
+    dht_ok = (dht.getStatus() == DHTesp::ERROR_NONE);
+    if (dht_ok) {
+      temperatureDHT11 = th.temperature;
+      humidityDHT11    = th.humidity;
+      Serial.println("DHT11 OK");
+    } else {
+      Serial.println("DHT11 no detectado — modo simulacion");
+      temperatureDHT11 = sim_tempDHT11;
+      humidityDHT11    = sim_humDHT11;
+    }
+  }
+
   // TSL2584 — el begin() ya espera la primera integración (450ms)
   tsl_ok = tsl_begin();
   if (tsl_ok) {
@@ -749,6 +777,22 @@ void loop() {
       humidity       = sim_humidity;
     }
 
+    // DHT11
+    {
+      TempAndHumidity th = dht.getTempAndHumidity();
+      if (dht.getStatus() == DHTesp::ERROR_NONE) {
+        dht_ok           = true;
+        temperatureDHT11 = th.temperature;
+        humidityDHT11    = th.humidity;
+      } else {
+        dht_ok = false;
+      }
+    }
+    if (!dht_ok) {
+      temperatureDHT11 = sim_tempDHT11;
+      humidityDHT11    = sim_humDHT11;
+    }
+
     // TSL2584
     if (tsl_ok) {
       float lux = tsl_readLux();
@@ -766,8 +810,9 @@ void loop() {
 #ifdef HAS_DISPLAY
     drawScreen();
 #else
-    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f\n",
+    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f\n",
       temperatureMCP, temperatureDHT, humidity,
+      temperatureDHT11, humidityDHT11,
       (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel);
 #endif
 
@@ -783,8 +828,9 @@ void loop() {
       digitalWrite(ledPin, LED_ON);
 
       String url = "http://" + String(server_ip) + ":" + String(server_port) + "/send_message";
-      // CSV: 9 valores — temperatura, presion, temp_bar, humedad,
-      //                   viento, direccion, viento_filtrado, dir_filtrada, luz
+      // CSV: 11 valores — temperatura, presion, temp_bar, humedad,
+      //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
+      //                    dht11_temperatura, dht11_humedad
       String msg = String(temperatureMCP, 2)    + "," +
                    String(pressure, 2)          + "," +
                    String(temperatureDHT, 2)    + "," +
@@ -793,7 +839,9 @@ void loop() {
                    String(currentWindDirDeg, 2) + "," +
                    String(windSpeedFiltered, 2) + "," +
                    String(finalAvgWindDir, 2)   + "," +
-                   String(lightLevel, 2);
+                   String(lightLevel, 2)        + "," +
+                   String(temperatureDHT11, 2)  + "," +
+                   String(humidityDHT11, 2);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
