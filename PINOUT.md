@@ -18,6 +18,7 @@
 |------------------------------|:-------------:|----------------------------|
 | MCP9808                      | 0x19          | Temperatura exterior       |
 | SparkFun MicroPressure       | 0x18 (def.)   | Presión barométrica        |
+| HTU2x (HTU21D / HTU20D)      | 0x40          | Temperatura + humedad      |
 | TSL2584 / APDS-9930 (clon)   | 0x39          | Luz ambiente (lux)         |
 
 > El sensor de viento (veleta de dirección) **no está disponible** en ESP8266
@@ -25,7 +26,7 @@
 
 ---
 
-## ESP32 (con pantalla TFT 240×135)
+## ESP32 — LilyGo TTGO T-Display (ESP32-D0WDQ6, pantalla ST7789 240×135)
 
 ### Pines definidos en firmware
 
@@ -38,10 +39,7 @@
 | Veleta (ADC)      | 36   |
 | LED onboard       | 2    |
 
-### Pines pantalla TFT (SPI) — TTGO T-Display 240×135
-
-> Estos pines se configuran en el archivo `User_Setup.h` de la librería TFT_eSPI.
-> Los valores siguientes corresponden al TTGO T-Display (LilyGO).
+### Pines pantalla TFT (SPI) — configurados en `User_Setup_Select.h` → `Setup25_TTGO_T_Display.h`
 
 | Función TFT | GPIO |
 |-------------|:----:|
@@ -58,17 +56,22 @@
 |----------------------------|:-------------:|----------------------------|
 | MCP9808                    | 0x19          | Temperatura exterior       |
 | SparkFun MicroPressure     | 0x18 (def.)   | Presión barométrica        |
+| HTU2x (HTU21D / HTU20D)    | 0x40          | Temperatura + humedad      |
 | TSL2584 / APDS-9930 (clon) | 0x39          | Luz ambiente (lux)         |
 
 ---
 
-## DHT11
+## DHT11 (sensor secundario)
 
-El DHT11 usa un único pin de datos (sin I2C). Conectar:
+El DHT11 es un sensor secundario de temperatura y humedad, independiente del bus I2C.
+
 - VCC → 3.3 V
 - GND → GND
-- DATA → GPIO definido arriba (D5 en ESP8266, GPIO15 en ESP32)
+- DATA → GPIO 14 (D5 en ESP8266) / GPIO 15 (en ESP32)
 - Resistencia pull-up de **4.7 kΩ** entre DATA y VCC
+
+> El sensor **primario** de temperatura y humedad es el HTU2x (I2C 0x40).
+> El DHT11 se envía como campos adicionales (posiciones 10 y 11 del CSV).
 
 ## Anemómetro (velocidad del viento)
 

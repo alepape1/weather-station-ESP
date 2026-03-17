@@ -94,6 +94,8 @@ float sim_tempDHT11 = 20.1f;
 float sim_humDHT11  = 60.0f;
 float sim_pressure  = 101.3f;
 float sim_light     = 300.0f;
+float sim_windSpeed = 3.5f;
+float sim_windDir   = 180.0f;
 
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
@@ -108,6 +110,8 @@ void updateSimulatedValues() {
   sim_humDHT11  = driftClamp(sim_humDHT11,   20.0f,  95.0f,  0.20f);
   sim_pressure  = driftClamp(sim_pressure,   95.0f, 110.0f,  0.02f);
   sim_light     = driftClamp(sim_light,       0.0f, 2000.0f, 5.0f);
+  sim_windSpeed = driftClamp(sim_windSpeed,   0.0f,   15.0f, 0.3f);
+  sim_windDir   = fmod(sim_windDir + ((float)random(-10, 11) / 10.0f) * 5.0f + 360.0f, 360.0f);
 }
 
 // =============================================================================
@@ -322,6 +326,59 @@ float calcAndResetWindVector() {
 bool lastServerOK    = false;
 unsigned long lastSendTime   = 0;
 unsigned long lastScreenTime = 0;
+
+// ── Info estática del hardware ────────────────────────────────────────────────
+void printHardwareInfo() {
+  Serial.println("\n=== Hardware Info ===");
+#ifdef ESP8266
+  Serial.printf("Chip         : ESP8266 (ID=0x%08X)\n", ESP.getChipId());
+#else
+  Serial.printf("Chip         : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
+#endif
+  Serial.printf("CPU          : %d MHz\n",      ESP.getCpuFreqMHz());
+  Serial.printf("Flash        : %d MB\n",        ESP.getFlashChipSize() / (1024 * 1024));
+  Serial.printf("Free Heap    : %d bytes\n",     ESP.getFreeHeap());
+  Serial.printf("SDK          : %s\n",           ESP.getSdkVersion());
+  Serial.printf("MAC          : %s\n",           WiFi.macAddress().c_str());
+  Serial.printf("IP           : %s\n",           WiFi.localIP().toString().c_str());
+  Serial.println("====================");
+}
+
+void postDeviceInfo() {
+  String chipModel;
+  int    chipRevision;
+#ifdef ESP8266
+  chipModel    = "ESP8266";
+  chipRevision = 0;
+#else
+  chipModel    = String(ESP.getChipModel());
+  chipRevision = (int)ESP.getChipRevision();
+#endif
+
+  String json = "{";
+  json += "\"chip_model\":\""  + chipModel + "\",";
+  json += "\"chip_revision\":" + String(chipRevision) + ",";
+  json += "\"cpu_freq_mhz\":"  + String(ESP.getCpuFreqMHz()) + ",";
+  json += "\"flash_size_mb\":" + String(ESP.getFlashChipSize() / (1024 * 1024)) + ",";
+  json += "\"sdk_version\":\""  + String(ESP.getSdkVersion()) + "\",";
+  json += "\"mac_address\":\""  + WiFi.macAddress() + "\",";
+  json += "\"ip_address\":\""   + WiFi.localIP().toString() + "\"";
+  json += "}";
+
+  String url = "http://" + String(server_ip) + ":" + String(server_port) + "/api/device_info";
+  HTTPClient http;
+  http.setTimeout(3000);
+#ifdef ESP8266
+  WiFiClient wifiClient;
+  http.begin(wifiClient, url);
+#else
+  http.begin(url);
+#endif
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(json);
+  http.end();
+  Serial.printf("[DeviceInfo] POST → %d\n", code);
+}
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 bool httpPost(const String& url, const String& body) {
@@ -688,6 +745,9 @@ void setup() {
     );
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
+    printHardwareInfo();
+    postDeviceInfo();
+
 #ifdef HAS_DISPLAY
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
@@ -714,17 +774,18 @@ void loop() {
   // ── 1. Lectura ADC viento (cada 100ms) ──────────────────────────────────────
   static unsigned long lastWindRead = 0;
   if (now - lastWindRead >= WIND_MS) {
+#ifdef HAS_DISPLAY
     int rawAne = analogRead(ANEMOMETER_PIN);
-
     float filtAne     = filteredADC(rawAne);
     windSpeed         = adcToWindSpeed((float)rawAne);
     windSpeedFiltered = adcToWindSpeed(filtAne);
-
-#ifdef HAS_DISPLAY
     int rawVane       = analogRead(VANE_PIN);
     currentWindDirDeg = adcToWindDeg(rawVane);
 #else
-    currentWindDirDeg = 0.0f;
+    // ESP8266 sin veleta: anemómetro y veleta simulados
+    windSpeed         = sim_windSpeed;
+    windSpeedFiltered = sim_windSpeed;
+    currentWindDirDeg = sim_windDir;
 #endif
 
     accumulateWindVector(currentWindDirDeg);
@@ -841,7 +902,10 @@ void loop() {
                    String(finalAvgWindDir, 2)   + "," +
                    String(lightLevel, 2)        + "," +
                    String(temperatureDHT11, 2)  + "," +
-                   String(humidityDHT11, 2);
+                   String(humidityDHT11, 2)     + "," +
+                   String(WiFi.RSSI())          + "," +
+                   String((long)ESP.getFreeHeap()) + "," +
+                   String((long)(millis() / 1000));
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
