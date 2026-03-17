@@ -8,6 +8,7 @@
   #include <ESP8266WiFi.h>
   #include <ESP8266HTTPClient.h>
   #include <WiFiClient.h>
+  #include <ArduinoOTA.h>
   #define I2C_SDA          4
   #define I2C_SCL          5
   #define ADC_VOLTAGE_REF  3.2f
@@ -16,6 +17,7 @@
 #else  // ESP32
   #include "WiFi.h"
   #include <HTTPClient.h>
+  #include <ArduinoOTA.h>
   #define I2C_SDA          21
   #define I2C_SCL          22
   #define ADC_VOLTAGE_REF  3.41f
@@ -625,11 +627,44 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi OK: " + WiFi.localIP().toString());
+
+    // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
+#ifdef ESP8266
+    ArduinoOTA.setHostname("meteostation-esp8266");
+#else
+    ArduinoOTA.setHostname("meteostation-esp32");
+#endif
+    // Contraseña OTA opcional — definir OTA_PASSWORD en secrets.h para activarla
+#ifdef OTA_PASSWORD
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+    ArduinoOTA.onStart([]() {
+      Serial.println("\n[OTA] Inicio de actualización");
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\n[OTA] Actualización completada — reiniciando");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("[OTA] %u%%\r", progress * 100 / total);
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("[OTA] Error %u\n", error);
+    });
+    ArduinoOTA.begin();
+    Serial.println("OTA listo — hostname: " +
+#ifdef ESP8266
+      String("meteostation-esp8266")
+#else
+      String("meteostation-esp32")
+#endif
+    );
+    // ── Fin OTA ─────────────────────────────────────────────────────────────
+
 #ifdef HAS_DISPLAY
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
-    Serial.println("Sin WiFi — continuando sin conexion");
+    Serial.println("Sin WiFi — continuando sin conexion (OTA no disponible)");
 #ifdef HAS_DISPLAY
     drawBootScreen("Sin WiFi — modo offline");
 #endif
@@ -644,6 +679,8 @@ void setup() {
 // LOOP
 // =============================================================================
 void loop() {
+  ArduinoOTA.handle();  // OTA — debe ser lo primero del loop
+
   unsigned long now = millis();
 
   // ── 1. Lectura ADC viento (cada 100ms) ──────────────────────────────────────
