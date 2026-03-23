@@ -3,7 +3,7 @@
 Firmware dual-plataforma para la estación meteorológica casera.
 Compatible con **ESP32** (LilyGo TTGO T-Display, con pantalla TFT 240×135) y **ESP8266** (sin pantalla).
 
-El ESP recoge datos de temperatura, humedad, presión, viento y luz; los muestra en pantalla (ESP32) y los envía cada 20 segundos al servidor Flask por HTTP.
+El ESP recoge datos de temperatura, humedad, presión, viento y luz; los muestra en pantalla (ESP32) y los envía cada 20 segundos al servidor Flask por **HTTPS** a [meteo.aquantialab.com](https://meteo.aquantialab.com).
 
 Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/alepape1/app_meteo)
 
@@ -90,14 +90,14 @@ Las credenciales de red se guardan en `secrets.h` (excluido del repositorio por 
 // secrets.h — NO subir al repositorio
 #define WIFI_SSID     "TU_RED_WIFI"
 #define WIFI_PASSWORD "TU_PASSWORD"
-#define SERVER_IP     "192.168.1.X"   // IP del PC/RPi donde corre Flask
-#define SERVER_PORT   7000
+#define SERVER_IP     "meteo.aquantialab.com"   // servidor de producción
+#define SERVER_PORT   443                        // HTTPS
 
 // Opcional: proteger OTA con contraseña
 // #define OTA_PASSWORD  "mi_password_ota"
 ```
 
-> Si Flask corre en WSL, usar la **IP WiFi de Windows** (no la de WSL). Con `networkingMode=mirrored` en `.wslconfig` la IP de WSL y Windows son la misma.
+> Para desarrollo local, cambiar `SERVER_IP` a la IP del PC/RPi donde corre Flask y `SERVER_PORT` a `7000`. Con WSL usar la IP WiFi de Windows (`networkingMode=mirrored` en `.wslconfig`).
 
 ---
 
@@ -120,19 +120,18 @@ networkingMode=mirrored
 
 ### Compilar y flashear
 
-```bash
-# Compilar (arduino-cli en WSL)
-arduino-cli compile --fqbn esp32:esp32:lilygo_t_display ESP_monitor_server/
+1. Compilar desde Arduino IDE en Windows: **Sketch → Exportar binario compilado** (`Ctrl+Alt+S`)
+2. Flashear por OTA desde WSL con el script incluido:
 
-# Flashear por OTA
-python3 ~/.arduino15/packages/esp32/hardware/esp32/3.3.7/tools/espota.py \
-  -i 192.168.1.13 -p 3232 \
-  -I $(ip route get 192.168.1.13 | grep src | awk '{print $5}') \
-  -r \
-  -f ~/.cache/arduino/sketches/*/ESP_monitor_server.ino.bin
+```bash
+# Hostname mDNS del dispositivo
+bash ota_flash.sh meteostation-esp32.local
+
+# O con IP directa si mDNS no resuelve
+bash ota_flash.sh 192.168.1.X
 ```
 
-> También existe el script `ota_flash.sh` en la raíz del repo, que usa el binario compilado desde Arduino IDE en Windows.
+El script `ota_flash.sh` localiza automáticamente `espota.py` y el `.bin` exportado desde Arduino IDE en Windows.
 
 ---
 
