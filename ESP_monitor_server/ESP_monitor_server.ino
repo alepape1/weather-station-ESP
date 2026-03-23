@@ -58,6 +58,12 @@ const int ledPin = 2;
 #define SCREEN_MS 1000
 #define SEND_MS  20000
 
+#ifdef HAS_DISPLAY
+#define DISPLAY_TIMEOUT_MS 60000UL  // Apagar pantalla tras 60s sin actividad
+#define BTN_LEFT   0                // Botón izquierdo (BOOT), INPUT_PULLUP, activo LOW
+#define BTN_RIGHT 35                // Botón derecho, activo LOW
+#endif
+
 // ── Objetos ────────────────────────────────────────────────────────────────────
 SparkFun_MicroPressure barometer;
 Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
@@ -66,6 +72,8 @@ DHTesp                 dht;
 #ifdef HAS_DISPLAY
   TFT_eSPI    tft = TFT_eSPI();
   TFT_eSprite spr = TFT_eSprite(&tft);
+  unsigned long lastActivityTime = 0;
+  bool          displayOn        = true;
 #endif
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
@@ -665,6 +673,9 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   spr.createSprite(240, 135);
   spr.setSwapBytes(true);
+  pinMode(BTN_LEFT,  INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT);
+  lastActivityTime = millis();
 #endif
 
   mcp_ok = tempsensor.begin(0x19);
@@ -779,6 +790,7 @@ void setup() {
       Serial.printf("[OTA] Error %u\n", error);
     });
     ArduinoOTA.begin();
+    WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
     Serial.println("OTA listo — hostname: " +
 #ifdef ESP8266
       String("meteostation-esp8266")
@@ -812,6 +824,22 @@ void loop() {
   ArduinoOTA.handle();  // OTA — debe ser lo primero del loop
 
   unsigned long now = millis();
+
+#ifdef HAS_DISPLAY
+  // Botones — cualquiera enciende la pantalla y resetea el timer
+  if (!digitalRead(BTN_LEFT) || !digitalRead(BTN_RIGHT)) {
+    if (!displayOn) {
+      digitalWrite(TFT_BL, HIGH);
+      displayOn = true;
+    }
+    lastActivityTime = now;
+  }
+  // Timeout — apagar pantalla tras DISPLAY_TIMEOUT_MS sin actividad
+  if (displayOn && (now - lastActivityTime >= DISPLAY_TIMEOUT_MS)) {
+    digitalWrite(TFT_BL, LOW);
+    displayOn = false;
+  }
+#endif
 
   // ── 1. Lectura ADC viento (cada 100ms) ──────────────────────────────────────
   static unsigned long lastWindRead = 0;
