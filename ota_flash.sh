@@ -1,6 +1,5 @@
 #!/bin/bash
-# ota_flash.sh — Flashea el ESP32 por OTA usando el .bin compilado en Windows
-# No requiere instalar Arduino en WSL. Solo Python3 (ya incluido en WSL).
+# ota_flash.sh — Compila el sketch con arduino-cli y flashea el ESP32 por OTA
 #
 # Uso:
 #   ./ota_flash.sh              → usa IP por defecto (192.168.1.13)
@@ -11,43 +10,34 @@ set -e
 # ── Configuración ─────────────────────────────────────────────────────────────
 ESP_IP="${1:-192.168.1.13}"
 ESP_PORT=3232
+FQBN="esp32:esp32:lilygo_t_display"
+SKETCH_DIR="$(cd "$(dirname "$0")/ESP_monitor_server" && pwd)"
+BUILD_DIR="/tmp/esp_build"
 SKETCH="ESP_monitor_server"
-BOARD_DIR="esp32.esp32.lilygo_t_display"
-WINDOWS_USER="Perfilador ResCoast"
+BIN="${BUILD_DIR}/${SKETCH}.ino.bin"
+ESPOTA="$HOME/.arduino15/packages/esp32/hardware/esp32/$(ls "$HOME/.arduino15/packages/esp32/hardware/esp32/" | sort -V | tail -1)/tools/espota.py"
 
-WIN_SKETCH_PATH="/mnt/c/Users/${WINDOWS_USER}/Homeserver_Nextcloud/Documents/Documentos Alejandro/Mis repositorios/Mis repos favoritos/weather-station-ESP/ESP_monitor_server"
-WIN_BIN="${WIN_SKETCH_PATH}/build/${BOARD_DIR}/${SKETCH}.ino.bin"
-
-ARDUINO15="/mnt/c/Users/${WINDOWS_USER}/AppData/Local/Arduino15"
-
-# ── Buscar espota.py en la instalación de Windows ─────────────────────────────
 echo "=== MeteoStation OTA Flash ==="
-echo "Target: ${ESP_IP}:${ESP_PORT}"
+echo "Target  : ${ESP_IP}:${ESP_PORT}"
+echo "Board   : ${FQBN}"
+echo "Sketch  : ${SKETCH_DIR}"
 echo ""
 
-ESPOTA=$(find "${ARDUINO15}/packages/esp32/hardware/esp32" -name "espota.py" 2>/dev/null | sort -V | tail -1)
+# ── Compilar ──────────────────────────────────────────────────────────────────
+echo "Compilando con arduino-cli..."
+arduino-cli compile \
+    --fqbn "$FQBN" \
+    --output-dir "$BUILD_DIR" \
+    "$SKETCH_DIR"
 
-if [ -z "$ESPOTA" ]; then
-    echo "ERROR: espota.py no encontrado en ${ARDUINO15}"
-    echo "Asegúrate de tener el core de ESP32 instalado en Arduino IDE de Windows."
-    exit 1
-fi
-echo "espota.py : ${ESPOTA}"
-
-# ── Verificar que el .bin existe ───────────────────────────────────────────────
-if [ ! -f "$WIN_BIN" ]; then
-    echo ""
-    echo "ERROR: No se encontró el .bin compilado:"
-    echo "  ${WIN_BIN}"
-    echo ""
-    echo "Compila primero desde Arduino IDE en Windows:"
-    echo "  Sketch → Exportar binario compilado  (Ctrl+Alt+S)"
+if [ ! -f "$BIN" ]; then
+    echo "ERROR: No se generó el .bin en ${BUILD_DIR}"
     exit 1
 fi
 
-BIN_SIZE=$(du -h "$WIN_BIN" | cut -f1)
-echo "Firmware  : ${WIN_BIN}"
-echo "Tamaño    : ${BIN_SIZE}"
+BIN_SIZE=$(du -h "$BIN" | cut -f1)
+echo ""
+echo "Firmware compilado: ${BIN} (${BIN_SIZE})"
 echo ""
 
 # ── Verificar conectividad ─────────────────────────────────────────────────────
@@ -63,7 +53,7 @@ fi
 # ── Flash OTA ─────────────────────────────────────────────────────────────────
 echo ""
 echo "Iniciando carga OTA..."
-python3 "$ESPOTA" -i "$ESP_IP" -p "$ESP_PORT" -f "$WIN_BIN"
+python3 "$ESPOTA" -i "$ESP_IP" -p "$ESP_PORT" -f "$BIN"
 
 echo ""
 echo "Listo. El ESP32 se reiniciará automáticamente."

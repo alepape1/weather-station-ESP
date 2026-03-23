@@ -398,15 +398,17 @@ void postDeviceInfo() {
   json += "}";
 
   String url = "https://" + String(server_ip) + "/api/device_info";
-  HTTPClient http;
-  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
+  HTTPClient http;
+  http.setTimeout(10000);
   http.begin(wifiClient, url);
 #else
   WiFiClientSecure client;
   client.setInsecure();
   client.setHandshakeTimeout(10);
+  HTTPClient http;
+  http.setTimeout(10000);
   http.begin(client, url);
 #endif
   http.addHeader("Content-Type", "application/json");
@@ -417,15 +419,17 @@ void postDeviceInfo() {
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 bool httpPost(const String& url, const String& body) {
-  HTTPClient http;
-  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
+  HTTPClient http;
+  http.setTimeout(10000);
   http.begin(wifiClient, url);
 #else
   WiFiClientSecure client;
   client.setInsecure();
   client.setHandshakeTimeout(10);
+  HTTPClient http;
+  http.setTimeout(10000);
   http.begin(client, url);
 #endif
   http.addHeader("Content-Type", "text/plain");
