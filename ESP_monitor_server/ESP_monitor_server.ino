@@ -399,13 +399,14 @@ void postDeviceInfo() {
 
   String url = "https://" + String(server_ip) + "/api/device_info";
   HTTPClient http;
-  http.setTimeout(3000);
+  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
   http.begin(wifiClient, url);
 #else
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(10);
   http.begin(client, url);
 #endif
   http.addHeader("Content-Type", "application/json");
@@ -417,13 +418,14 @@ void postDeviceInfo() {
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 bool httpPost(const String& url, const String& body) {
   HTTPClient http;
-  http.setTimeout(3000);
+  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
   http.begin(wifiClient, url);
 #else
   WiFiClientSecure client;
   client.setInsecure();
+  client.setHandshakeTimeout(10);
   http.begin(client, url);
 #endif
   http.addHeader("Content-Type", "text/plain");
@@ -783,7 +785,6 @@ void setup() {
     // ── Fin OTA ─────────────────────────────────────────────────────────────
 
     printHardwareInfo();
-    postDeviceInfo();
 
 #ifdef HAS_DISPLAY
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
@@ -918,6 +919,12 @@ void loop() {
   }
 
   // ── 3. Envío HTTP (cada 20s) ─────────────────────────────────────────────────
+  static bool deviceInfoSent = false;
+  if (!deviceInfoSent && WiFi.status() == WL_CONNECTED) {
+    postDeviceInfo();
+    deviceInfoSent = true;
+  }
+
   if (now - lastSendTime >= SEND_MS) {
     finalAvgWindDir = calcAndResetWindVector();
     bool ok = false;
