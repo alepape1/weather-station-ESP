@@ -644,6 +644,7 @@ void drawBootScreen(const char* wifiMsg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  setCpuFrequencyMhz(80);
   Serial.println("\n\n=== MeteoStation BOOT ===");
 
   Serial.println("Iniciando I2C...");
