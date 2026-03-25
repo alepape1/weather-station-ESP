@@ -15,6 +15,7 @@
   #define ADC_VOLTAGE_REF  3.2f
   #define ADC_RANGE        1024.0f
   #define ANEMOMETER_PIN   A0
+  #define RELAY_PIN       12   // D6 — GPIO libre para relay electroválvula
 #else  // ESP32
   #include "WiFi.h"
   #include <HTTPClient.h>
@@ -28,6 +29,7 @@
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
   #define HAS_DISPLAY
+  #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
 
 #include <SPI.h>
@@ -54,9 +56,10 @@ const int ledPin = 2;
 #define LED_OFF HIGH
 
 // ── Intervalos ─────────────────────────────────────────────────────────────────
-#define WIND_MS    100
-#define SCREEN_MS 1000
-#define SEND_MS  20000
+#define WIND_MS       100
+#define SCREEN_MS    1000
+#define SEND_MS     20000
+#define RELAY_MS     2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 60000UL  // Apagar pantalla tras 60s sin actividad
@@ -75,6 +78,10 @@ DHTesp                 dht;
   unsigned long lastActivityTime = 0;
   bool          displayOn        = true;
 #endif
+
+// ── Relay electroválvula ───────────────────────────────────────────────────────
+// JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
+bool relayActive = false;
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
@@ -425,7 +432,43 @@ void postDeviceInfo() {
   Serial.printf("[DeviceInfo] POST → %d\n", code);
 }
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+String httpGet(const String& url, int timeoutMs = 10000) {
+#ifdef ESP8266
+  WiFiClient wifiClient;
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  http.begin(wifiClient, url);
+#else
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(timeoutMs / 1000);
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  http.begin(client, url);
+#endif
+  int code = http.GET();
+  String body = "";
+  if (code == 200) body = http.getString();
+  http.end();
+  body.trim();
+  return body;
+}
+
+void checkRelayCommand() {
+  String url = "https://" + String(server_ip) + "/api/relay/command";
+  String response = httpGet(url, 2000);  // timeout corto — respuesta rápida
+  if (response == "1" && !relayActive) {
+    relayActive = true;
+    digitalWrite(RELAY_PIN, LOW);   // LOW = relay ON (activo-LOW)
+    Serial.println("[Relay] ON — valvula abierta");
+  } else if (response == "0" && relayActive) {
+    relayActive = false;
+    digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay OFF
+    Serial.println("[Relay] OFF — valvula cerrada");
+  }
+}
+
 bool httpPost(const String& url, const String& body) {
 #ifdef ESP8266
   WiFiClient wifiClient;
@@ -667,6 +710,11 @@ void setup() {
 
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LED_OFF);
+
+  // Relay — arrancar siempre en OFF (seguro)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay OFF (activo-LOW)
+  Serial.println("Relay OFF (inicio seguro)");
 
 #ifdef HAS_DISPLAY
   tft.init();
@@ -951,7 +999,14 @@ void loop() {
     lastScreenTime = now;
   }
 
-  // ── 3. Envío HTTP (cada 20s) ─────────────────────────────────────────────────
+  // ── 3. Relay (cada 2s) — respuesta casi inmediata al pulsar en el dashboard ───
+  static unsigned long lastRelayCheck = 0;
+  if (now - lastRelayCheck >= RELAY_MS && WiFi.status() == WL_CONNECTED) {
+    checkRelayCommand();
+    lastRelayCheck = now;
+  }
+
+  // ── 4. Envío HTTP (cada 20s) ─────────────────────────────────────────────────
   static bool deviceInfoSent = false;
   if (!deviceInfoSent && WiFi.status() == WL_CONNECTED) {
     postDeviceInfo();
@@ -966,9 +1021,10 @@ void loop() {
       digitalWrite(ledPin, LED_ON);
 
       String url = "https://" + String(server_ip) + "/send_message";
-      // CSV: 11 valores — temperatura, presion, temp_bar, humedad,
+      // CSV: 15 valores — temperatura, presion, temp_bar, humedad,
       //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
-      //                    dht11_temperatura, dht11_humedad
+      //                    dht11_temperatura, dht11_humedad,
+      //                    rssi, free_heap, uptime_s, relay_active
       String msg = String(temperatureMCP, 2)    + "," +
                    String(pressure, 2)          + "," +
                    String(temperatureDHT, 2)    + "," +
@@ -982,7 +1038,8 @@ void loop() {
                    String(humidityDHT11, 2)     + "," +
                    String(WiFi.RSSI())          + "," +
                    String((long)ESP.getFreeHeap()) + "," +
-                   String((long)(millis() / 1000));
+                   String((long)(millis() / 1000)) + "," +
+                   String(relayActive ? 1 : 0);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
