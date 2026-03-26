@@ -1,9 +1,9 @@
-# MeteoStation — Firmware ESP v3
+# MeteoStation — Firmware ESP v4
 
 Firmware dual-plataforma para la estación meteorológica casera.
 Compatible con **ESP32** (LilyGo TTGO T-Display, con pantalla TFT 240×135) y **ESP8266** (sin pantalla).
 
-El ESP recoge datos de temperatura, humedad, presión, viento y luz; los muestra en pantalla (ESP32) y los envía cada 20 segundos al servidor Flask por **HTTPS** a [meteo.aquantialab.com](https://meteo.aquantialab.com).
+El ESP recoge datos de temperatura, humedad, presión, viento y luz; los muestra en pantalla (ESP32) y los envía cada 20 segundos al servidor Flask por **HTTPS** a [meteo.aquantialab.com](https://meteo.aquantialab.com). Incluye control de **relay para electroválvula** con polling cada 2s desde el dashboard.
 
 Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/alepape1/app_meteo)
 
@@ -17,6 +17,8 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 - [Configuración antes de compilar](#configuración-antes-de-compilar)
 - [Flashear por OTA desde WSL](#flashear-por-ota-desde-wsl)
 - [Arquitectura del firmware](#arquitectura-del-firmware)
+- [Ahorro energético](#ahorro-energético)
+- [Relay electroválvula](#relay-electroválvula)
 - [Simulación de sensores](#simulación-de-sensores)
 - [Algoritmos](#algoritmos)
 - [Formato de datos enviados al servidor](#formato-de-datos-enviados-al-servidor)
@@ -39,6 +41,8 @@ Repositorio del servidor y dashboard: [alepape1/app_meteo](https://github.com/al
 | Veleta | Analógica 0–3.3 V | 0–360°, GPIO36 (solo ESP32) |
 | Pantalla | ST7789 240×135 integrada | Gestionada por TFT_eSPI |
 | LED indicador | GPIO 2 onboard | Parpadea al enviar datos |
+| Relay | JQC-3FF-S-Z (activo-LOW) | Electroválvula; GPIO26 (ESP32) / D6-GPIO12 (ESP8266) |
+| Botones | BOOT (GPIO0) + GPIO35 | Encienden pantalla y resetean timer de apagado (solo ESP32) |
 
 ---
 
@@ -144,15 +148,48 @@ loop()
  ├─ ArduinoOTA.handle()            ← siempre primero
  ├─ Cada 100ms  → Leer ADC anemómetro/veleta, acumular vector de viento
  ├─ Cada 1s     → Leer MCP9808, HTU2x, barómetro, luz. Actualizar pantalla/serial
+ ├─ Cada 2s     → Consultar /api/relay/command y actuar relay si cambia el estado
  └─ Cada 20s    → Calcular promedio vectorial, enviar HTTP POST al servidor
 ```
 
 Al arrancar (`setup()`):
-1. Escanear bus I2C y detectar sensores
-2. Conectar WiFi
-3. Iniciar ArduinoOTA
-4. Imprimir info del hardware por serie
-5. Enviar POST a `/api/device_info` con datos estáticos del chip
+1. Reducir CPU a 80 MHz (`setCpuFrequencyMhz(80)`)
+2. Escanear bus I2C y detectar sensores
+3. Si HTU2x detectado: calentamiento 3s con calefactor interno (evaporar condensación)
+4. Conectar WiFi
+5. Iniciar ArduinoOTA
+6. Activar Modem Sleep (`WiFi.setSleep(true)`)
+7. Imprimir info del hardware por serie
+8. Enviar POST a `/api/device_info` con datos estáticos del chip
+
+---
+
+## Ahorro energético
+
+Tres medidas activas para reducir el consumo:
+
+| Medida | Configuración | Ahorro estimado |
+|--------|---------------|-----------------|
+| CPU a 80 MHz | `setCpuFrequencyMhz(80)` en `setup()` | ~30–40% vs 240 MHz |
+| Modem Sleep | `WiFi.setSleep(true)` tras conectar | ~15–20 mA entre transmisiones |
+| Pantalla con timeout | Se apaga tras 60s sin actividad (`DISPLAY_TIMEOUT_MS`) | Variable según brillo |
+
+Los **botones** (GPIO0/BOOT y GPIO35) reactivan la pantalla instantáneamente y reinician el timer de 60s.
+
+---
+
+## Relay electroválvula
+
+El firmware controla un relay **activo-LOW** (JQC-3FF-S-Z o compatible):
+
+- `LOW` → relay ON → válvula abierta
+- `HIGH` → relay OFF → válvula cerrada (estado seguro al arrancar)
+
+Cada 2s el ESP consulta `GET /api/relay/command`. Si la respuesta cambia de `"0"` a `"1"` (o viceversa), actúa el relay de inmediato. Esto permite una latencia de activación máxima de ~2s desde el dashboard.
+
+**Pines:**
+- ESP32: GPIO26
+- ESP8266: GPIO12 (D6)
 
 ---
 
@@ -208,7 +245,7 @@ El chip en 0x39 se identifica leyendo el registro de ID:
 
 ### CSV periódico — `POST /send_message` (cada 20s)
 
-14 valores separados por coma:
+15 valores separados por coma:
 
 | Pos | Campo | Sensor | Unidad |
 |-----|-------|--------|--------|
@@ -226,12 +263,13 @@ El chip en 0x39 se identifica leyendo el registro de ID:
 | 11 | `rssi` | WiFi | dBm |
 | 12 | `free_heap` | ESP32 | bytes |
 | 13 | `uptime_s` | ESP32 | segundos |
+| 14 | `relay_active` | Relay | 0/1 |
 
 > *La presión se envía en kPa (~101.3). Pendiente corregir a hPa con `readPressure(PA)/100.0`.
 
 Ejemplo:
 ```
-25.31,101.14,23.01,69.33,0.00,0.00,0.00,0.00,0.48,25.00,15.00,-62,142256,120
+25.31,101.14,23.01,69.33,0.00,0.00,0.00,0.00,0.48,25.00,15.00,-62,142256,120,0
 ```
 
 ### Info estática del dispositivo — `POST /api/device_info` (al arrancar)
@@ -242,7 +280,7 @@ JSON enviado una vez tras conectar WiFi:
 {
   "chip_model": "ESP32-D0WDQ6",
   "chip_revision": 101,
-  "cpu_freq_mhz": 240,
+  "cpu_freq_mhz": 80,
   "flash_size_mb": 16,
   "sdk_version": "v5.5.2-729-g87912cd291",
   "mac_address": "88:13:BF:FD:A2:38",
@@ -256,7 +294,9 @@ JSON enviado una vez tras conectar WiFi:
 
 Resolución: **240×135 px** (ST7789, LilyGo TTGO T-Display). Doble buffer con `TFT_eSprite` → `pushSprite()` atómico, sin parpadeo.
 
-La pantalla se actualiza cada segundo:
+La pantalla se actualiza cada segundo. Se apaga automáticamente tras **60s sin actividad** (`DISPLAY_TIMEOUT_MS`). Cualquiera de los dos botones (GPIO0/BOOT o GPIO35) la reactiva y reinicia el timer.
+
+Layout:
 
 ```
 ┌────────────────────────────────────────┐
@@ -282,3 +322,4 @@ Badge `[OK]` verde = sensor real. Badge `[SIM]` naranja = sensor simulado.
 |----------|--------|----------|
 | Presión en kPa en vez de hPa | Pendiente | Cambiar `readPressure(KPA)` → `readPressure(PA) / 100.0` |
 | DHT11 lecturas inestables | Conocido | Valorar reemplazar por DHT22 o SHT31 |
+| Comentario de versión en `.ino` dice v3 | Pendiente | Actualizar la línea 1 del fichero `.ino` a `// MeteoStation — Firmware v4` |
