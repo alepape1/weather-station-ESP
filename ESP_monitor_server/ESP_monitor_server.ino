@@ -462,10 +462,14 @@ void checkRelayCommand() {
     relayActive = true;
     digitalWrite(RELAY_PIN, LOW);   // LOW = relay ON (activo-LOW)
     Serial.println("[Relay] ON — valvula abierta");
+    // ACK inmediato: el dashboard no necesita esperar el ciclo de 20s
+    httpPost("https://" + String(server_ip) + "/api/relay/ack", "1");
   } else if (response == "0" && relayActive) {
     relayActive = false;
     digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay OFF
     Serial.println("[Relay] OFF — valvula cerrada");
+    // ACK inmediato
+    httpPost("https://" + String(server_ip) + "/api/relay/ack", "0");
   }
 }
 
