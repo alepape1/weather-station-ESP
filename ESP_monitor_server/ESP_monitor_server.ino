@@ -32,6 +32,13 @@
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
 
+// ── Pipeline — constantes físicas del simulador ───────────────────────────────
+#define PIPELINE_STATIC_P   3.50f  // bar — presión estática (válvula cerrada)
+#define PIPELINE_DYNAMIC_P  2.80f  // bar — presión dinámica a caudal nominal
+#define PIPELINE_NOISE_P    0.04f  // bar — dispersión sensor de presión
+#define PIPELINE_NOISE_Q    0.12f  // L/min — dispersión caudalímetro
+#define PIPELINE_NOMINAL_Q  5.00f  // L/min — caudal nominal del sistema
+
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_MCP9808.h>
@@ -113,6 +120,11 @@ float sim_light     = 300.0f;
 float sim_windSpeed = 3.5f;
 float sim_windDir   = 180.0f;
 
+// ── Pipeline simulado ─────────────────────────────────────────────────────────
+String pipelineScenario      = "normal";  // actualizado desde el servidor cada 20s
+float  sim_pipeline_pressure = PIPELINE_STATIC_P;
+float  sim_pipeline_flow     = 0.0f;
+
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
   return constrain(v + d, mn, mx);
@@ -128,6 +140,46 @@ void updateSimulatedValues() {
   sim_light     = driftClamp(sim_light,       0.0f, 2000.0f, 5.0f);
   sim_windSpeed = driftClamp(sim_windSpeed,   0.0f,   15.0f, 0.3f);
   sim_windDir   = fmod(sim_windDir + ((float)random(-10, 11) / 10.0f) * 5.0f + 360.0f, 360.0f);
+}
+
+// ── Pipeline simulator ────────────────────────────────────────────────────────
+// Ruido determinista idéntico al de pipeline_sim.py: tres ondas sinusoidales.
+// Reproducible y sin random() → facilita comparar resultados con el backend.
+static float pipelineNoise(float t_s, int ch) {
+  return sinf(t_s *  7.3f + ch * 1.7f) * 0.55f
+       + sinf(t_s * 13.1f + ch * 3.2f) * 0.30f
+       + sinf(t_s * 31.7f + ch * 5.1f) * 0.15f;
+}
+
+void updatePipelineSimValues() {
+  float t       = millis() / 1000.0f;
+  float p_noise = pipelineNoise(t, 0) * PIPELINE_NOISE_P;
+  float q_noise = pipelineNoise(t, 1) * PIPELINE_NOISE_Q;
+
+  if (pipelineScenario == "burst") {
+    sim_pipeline_pressure = max(0.0f, 0.25f + p_noise * 0.4f);
+    sim_pipeline_flow     = relayActive
+      ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
+      : 0.0f;
+
+  } else if (pipelineScenario == "leak") {
+    if (relayActive) {
+      sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P - 0.18f + p_noise);
+      sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q - 0.45f + q_noise);
+    } else {
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P - 0.10f + p_noise);
+      sim_pipeline_flow     = max(0.0f, 0.28f + fabsf(q_noise) * 0.35f);
+    }
+
+  } else {  // "normal"
+    if (relayActive) {
+      sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P + p_noise);
+      sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q + q_noise);
+    } else {
+      sim_pipeline_pressure = max(0.0f, PIPELINE_STATIC_P + p_noise);
+      sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
+    }
+  }
 }
 
 // =============================================================================
@@ -1024,26 +1076,38 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       digitalWrite(ledPin, LED_ON);
 
+      // Consultar escenario pipeline al servidor (texto plano: normal/leak/burst)
+      {
+        String scUrl = "https://" + String(server_ip) + "/api/pipeline/scenario";
+        String sc    = httpGet(scUrl, 3000);
+        sc.trim();
+        if (sc == "leak" || sc == "burst" || sc == "normal") pipelineScenario = sc;
+      }
+      updatePipelineSimValues();
+
       String url = "https://" + String(server_ip) + "/send_message";
-      // CSV: 15 valores — temperatura, presion, temp_bar, humedad,
+      // CSV: 17 valores — temperatura, presion, temp_bar, humedad,
       //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
       //                    dht11_temperatura, dht11_humedad,
-      //                    rssi, free_heap, uptime_s, relay_active
-      String msg = String(temperatureMCP, 2)    + "," +
-                   String(pressure, 2)          + "," +
-                   String(temperatureDHT, 2)    + "," +
-                   String(humidity, 2)          + "," +
-                   String(windSpeed, 2)         + "," +
-                   String(currentWindDirDeg, 2) + "," +
-                   String(windSpeedFiltered, 2) + "," +
-                   String(finalAvgWindDir, 2)   + "," +
-                   String(lightLevel, 2)        + "," +
-                   String(temperatureDHT11, 2)  + "," +
-                   String(humidityDHT11, 2)     + "," +
-                   String(WiFi.RSSI())          + "," +
-                   String((long)ESP.getFreeHeap()) + "," +
-                   String((long)(millis() / 1000)) + "," +
-                   String(relayActive ? 1 : 0);
+      //                    rssi, free_heap, uptime_s, relay_active,
+      //                    pipeline_pressure (bar), pipeline_flow (L/min)
+      String msg = String(temperatureMCP, 2)         + "," +
+                   String(pressure, 2)               + "," +
+                   String(temperatureDHT, 2)         + "," +
+                   String(humidity, 2)               + "," +
+                   String(windSpeed, 2)              + "," +
+                   String(currentWindDirDeg, 2)      + "," +
+                   String(windSpeedFiltered, 2)      + "," +
+                   String(finalAvgWindDir, 2)        + "," +
+                   String(lightLevel, 2)             + "," +
+                   String(temperatureDHT11, 2)       + "," +
+                   String(humidityDHT11, 2)          + "," +
+                   String(WiFi.RSSI())               + "," +
+                   String((long)ESP.getFreeHeap())   + "," +
+                   String((long)(millis() / 1000))   + "," +
+                   String(relayActive ? 1 : 0)       + "," +
+                   String(sim_pipeline_pressure, 3)  + "," +
+                   String(sim_pipeline_flow, 3);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);

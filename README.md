@@ -207,6 +207,38 @@ Si un sensor no responde en el `setup()` o falla durante el funcionamiento, el f
 
 ---
 
+## Pipeline — Simulador de caudalímetro y sensor de presión
+
+El firmware incluye un **simulador de pipeline** que genera valores realistas de presión (bar) y caudal (L/min) según el estado de la electroválvula y el escenario configurado en el servidor.
+
+### Funcionamiento
+
+Antes de cada envío HTTP (cada 20s), el ESP32:
+1. Consulta `GET /api/pipeline/scenario` → obtiene `normal`, `leak` o `burst`
+2. Calcula presión y caudal con **ruido determinista** (ondas sinusoidales del timestamp):
+
+```cpp
+float pipelineNoise(float t_s, int ch) {
+  return sin(t_s * 7.3 + ch * 1.7) * 0.55
+       + sin(t_s * 13.1 + ch * 3.2) * 0.30
+       + sin(t_s * 31.7 + ch * 5.1) * 0.15;
+}
+```
+
+3. Envía los valores como campos 15 y 16 del CSV
+
+### Escenarios
+
+| Escenario | Válvula cerrada | Válvula abierta |
+|-----------|----------------|-----------------|
+| `normal`  | P≈3.50 bar, Q≈0 | P≈2.80 bar, Q≈nominal |
+| `leak`    | P≈3.40 bar, Q≈0.28 L/min (fuga) | P≈2.62 bar, Q≈nominal−0.45 |
+| `burst`   | P≈0.25 bar, Q≈0 | P≈0.25 bar, Q≈nominal×0.08 |
+
+El escenario se cambia desde el dashboard (vista Pipeline → selector de escenario) sin necesidad de recompilar el firmware. Cuando se instalen los sensores físicos, solo hay que sustituir `sim_pipeline_pressure` y `sim_pipeline_flow` por la lectura real del ADC/I2C.
+
+---
+
 ## Algoritmos
 
 ### Velocidad del viento — Media móvil (buffer circular de 10 muestras)
@@ -245,7 +277,7 @@ El chip en 0x39 se identifica leyendo el registro de ID:
 
 ### CSV periódico — `POST /send_message` (cada 20s)
 
-15 valores separados por coma:
+17 valores separados por coma:
 
 | Pos | Campo | Sensor | Unidad |
 |-----|-------|--------|--------|
@@ -262,6 +294,16 @@ El chip en 0x39 se identifica leyendo el registro de ID:
 | 10 | `dht_humidity` | DHT11 | % |
 | 11 | `rssi` | WiFi | dBm |
 | 12 | `free_heap` | ESP32 | bytes |
+| 13 | `uptime_s` | ESP32 | s |
+| 14 | `relay_active` | GPIO26 | 0/1 |
+| 15 | `pipeline_pressure` | Simulado† | bar |
+| 16 | `pipeline_flow` | Simulado† | L/min |
+
+> †Campos 15 y 16: simulación de caudalímetro y sensor de presión de tubería.
+> El ESP32 consulta `GET /api/pipeline/scenario` antes de cada envío y genera
+> valores deterministas (ondas sinusoidales del tiempo) según el escenario activo
+> (`normal` / `leak` / `burst`). Se sustituirán por lecturas reales cuando se
+> instalen los sensores físicos.
 | 13 | `uptime_s` | ESP32 | segundos |
 | 14 | `relay_active` | Relay | 0/1 |
 
