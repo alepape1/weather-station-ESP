@@ -460,13 +460,13 @@ void checkRelayCommand() {
   String response = httpGet(url, 2000);  // timeout corto — respuesta rápida
   if (response == "1" && !relayActive) {
     relayActive = true;
-    digitalWrite(RELAY_PIN, LOW);   // LOW = relay ON (activo-LOW)
+    digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay ON (activo-HIGH)
     Serial.println("[Relay] ON — valvula abierta");
     // ACK inmediato: el dashboard no necesita esperar el ciclo de 20s
     httpPost("https://" + String(server_ip) + "/api/relay/ack", "1");
   } else if (response == "0" && relayActive) {
     relayActive = false;
-    digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay OFF
+    digitalWrite(RELAY_PIN, LOW);   // LOW = relay OFF
     Serial.println("[Relay] OFF — valvula cerrada");
     // ACK inmediato
     httpPost("https://" + String(server_ip) + "/api/relay/ack", "0");
@@ -717,7 +717,7 @@ void setup() {
 
   // Relay — arrancar siempre en OFF (seguro)
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay OFF (activo-LOW)
+  digitalWrite(RELAY_PIN, LOW);   // LOW = relay OFF (activo-HIGH)
   Serial.println("Relay OFF (inicio seguro)");
 
 #ifdef HAS_DISPLAY
