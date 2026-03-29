@@ -540,6 +540,7 @@ bool httpPost(const String& url, const String& body) {
   http.begin(client, url);
 #endif
   http.addHeader("Content-Type", "text/plain");
+  http.addHeader("X-Device-MAC", WiFi.macAddress());
   int code = http.POST(body);
   http.end();
   return (code == 200 || code == 201);
@@ -550,15 +551,16 @@ bool httpPost(const String& url, const String& body) {
 // =============================================================================
 #ifdef HAS_DISPLAY
 
-#define C_BG      0x0841
-#define C_CARD    0x1082
-#define C_HDR     0x0421
-#define C_BORDER  0x2124
-#define C_TEXT    0xFFFF
-#define C_LABEL   0x7BEF
-#define C_SIM     0xFD20
-#define C_REAL    0x07E0
-#define C_RED     0xF800
+// Paleta Aquantia: azul corporativo #5ab4e0 · cabecera navy #0d3a6e
+#define C_BG      0x0841   // fondo general    ~#0d0d0d
+#define C_CARD    0x1082   // fondo tarjeta    ~#101010
+#define C_HDR     0x09CD   // cabecera         ~#0d3a6e (navy Aquantia)
+#define C_BORDER  0x2124   // borde tarjeta
+#define C_TEXT    0xFFFF   // texto principal  blanco
+#define C_LABEL   0x7BEF   // etiqueta gris claro
+#define C_SIM     0xFD20   // simulado         naranja
+#define C_REAL    0x5DBC   // dato real        #5ab4e0 (azul Aquantia)
+#define C_RED     0xF800   // error/alerta     rojo
 
 // Layout 240×135 — 2 filas × 3 cols + fila extra para luz
 // Fila 0-1: misma cuadrícula 2×3 de siempre (tarjetas 79×57)
@@ -1076,38 +1078,26 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       digitalWrite(ledPin, LED_ON);
 
-      // Consultar escenario pipeline al servidor (texto plano: normal/leak/burst)
-      {
-        String scUrl = "https://" + String(server_ip) + "/api/pipeline/scenario";
-        String sc    = httpGet(scUrl, 3000);
-        sc.trim();
-        if (sc == "leak" || sc == "burst" || sc == "normal") pipelineScenario = sc;
-      }
-      updatePipelineSimValues();
-
       String url = "https://" + String(server_ip) + "/send_message";
-      // CSV: 17 valores — temperatura, presion, temp_bar, humedad,
+      // CSV: 15 valores — temperatura, presion, temp_bar, humedad,
       //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
       //                    dht11_temperatura, dht11_humedad,
-      //                    rssi, free_heap, uptime_s, relay_active,
-      //                    pipeline_pressure (bar), pipeline_flow (L/min)
-      String msg = String(temperatureMCP, 2)         + "," +
-                   String(pressure, 2)               + "," +
-                   String(temperatureDHT, 2)         + "," +
-                   String(humidity, 2)               + "," +
-                   String(windSpeed, 2)              + "," +
-                   String(currentWindDirDeg, 2)      + "," +
-                   String(windSpeedFiltered, 2)      + "," +
-                   String(finalAvgWindDir, 2)        + "," +
-                   String(lightLevel, 2)             + "," +
-                   String(temperatureDHT11, 2)       + "," +
-                   String(humidityDHT11, 2)          + "," +
-                   String(WiFi.RSSI())               + "," +
-                   String((long)ESP.getFreeHeap())   + "," +
-                   String((long)(millis() / 1000))   + "," +
-                   String(relayActive ? 1 : 0)       + "," +
-                   String(sim_pipeline_pressure, 3)  + "," +
-                   String(sim_pipeline_flow, 3);
+      //                    rssi, free_heap, uptime_s, relay_active
+      String msg = String(temperatureMCP, 2)    + "," +
+                   String(pressure, 2)          + "," +
+                   String(temperatureDHT, 2)    + "," +
+                   String(humidity, 2)          + "," +
+                   String(windSpeed, 2)         + "," +
+                   String(currentWindDirDeg, 2) + "," +
+                   String(windSpeedFiltered, 2) + "," +
+                   String(finalAvgWindDir, 2)   + "," +
+                   String(lightLevel, 2)        + "," +
+                   String(temperatureDHT11, 2)  + "," +
+                   String(humidityDHT11, 2)     + "," +
+                   String(WiFi.RSSI())          + "," +
+                   String((long)ESP.getFreeHeap()) + "," +
+                   String((long)(millis() / 1000)) + "," +
+                   String(relayActive ? 1 : 0);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);

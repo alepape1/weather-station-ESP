@@ -2,7 +2,7 @@
 # ota_flash.sh — Compila el sketch con arduino-cli y flashea el ESP32 por OTA
 #
 # Uso:
-#   ./ota_flash.sh              → usa IP por defecto (192.168.1.13)
+#   ./ota_flash.sh              → usa IP por defecto (192.168.1.9)
 #   ./ota_flash.sh 192.168.1.X  → IP personalizada
 
 set -e
@@ -12,10 +12,18 @@ ESP_IP="${1:-192.168.1.9}"
 ESP_PORT=3232
 FQBN="esp32:esp32:lilygo_t_display"
 SKETCH_DIR="$(cd "$(dirname "$0")/ESP_monitor_server" && pwd)"
-BUILD_DIR="/tmp/esp_build"
+BUILD_DIR="$LOCALAPPDATA/Temp/esp_ota_build"
 SKETCH="ESP_monitor_server"
 BIN="${BUILD_DIR}/${SKETCH}.ino.bin"
-ESPOTA="$HOME/.arduino15/packages/esp32/hardware/esp32/$(ls "$HOME/.arduino15/packages/esp32/hardware/esp32/" | sort -V | tail -1)/tools/espota.py"
+
+# arduino-cli embebido en Arduino IDE 2.x (Windows)
+ARDUINO_CLI="/c/Program Files/Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe"
+# Python 3 en Windows
+PYTHON="/c/Users/Perfilador ResCoast/AppData/Local/Programs/Python/Python312/python.exe"
+# espota.py — detecta la versión instalada automáticamente
+ARDUINO15="$LOCALAPPDATA/Arduino15"
+ESP32_VER=$(ls "$ARDUINO15/packages/esp32/hardware/esp32/" | sort -V | tail -1)
+ESPOTA="$ARDUINO15/packages/esp32/hardware/esp32/${ESP32_VER}/tools/espota.py"
 
 echo "=== MeteoStation OTA Flash ==="
 echo "Target  : ${ESP_IP}:${ESP_PORT}"
@@ -25,9 +33,10 @@ echo ""
 
 # ── Compilar ──────────────────────────────────────────────────────────────────
 echo "Compilando con arduino-cli..."
-arduino-cli compile \
+mkdir -p "$BUILD_DIR"
+"$ARDUINO_CLI" compile \
     --fqbn "$FQBN" \
-    --output-dir "$BUILD_DIR" \
+    --build-path "$BUILD_DIR" \
     "$SKETCH_DIR"
 
 if [ ! -f "$BIN" ]; then
@@ -53,7 +62,7 @@ fi
 # ── Flash OTA ─────────────────────────────────────────────────────────────────
 echo ""
 echo "Iniciando carga OTA..."
-python3 "$ESPOTA" -i "$ESP_IP" -p "$ESP_PORT" -f "$BIN"
+"$PYTHON" "$ESPOTA" -i "$ESP_IP" -p "$ESP_PORT" -f "$BIN"
 
 echo ""
 echo "Listo. El ESP32 se reiniciará automáticamente."
