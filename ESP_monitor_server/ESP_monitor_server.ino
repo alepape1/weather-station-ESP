@@ -47,6 +47,29 @@
 #include <math.h>
 #include "secrets.h"
 
+// ── Perfiles de dispositivo (definir DEVICE_PROFILE en secrets.h) ─────────────
+#define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
+#define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
+
+#ifndef DEVICE_PROFILE
+  #define DEVICE_PROFILE PROFILE_METEO
+#endif
+
+#if DEVICE_PROFILE == PROFILE_IRRIGATION
+  #define RELAY_COUNT 4
+  #ifndef RELAY_PIN_1
+    #define RELAY_PIN_1 26
+    #define RELAY_PIN_2 25
+    #define RELAY_PIN_3 33
+    #define RELAY_PIN_4 32
+  #endif
+  static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
+                                                   RELAY_PIN_3, RELAY_PIN_4};
+#else
+  #define RELAY_COUNT 1
+  static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN};
+#endif
+
 #ifdef HAS_DISPLAY
   #include <TFT_eSPI.h>
 #endif
@@ -86,9 +109,10 @@ DHTesp                 dht;
   bool          displayOn        = true;
 #endif
 
-// ── Relay electroválvula ───────────────────────────────────────────────────────
+// ── Relay electroválvula(s) ────────────────────────────────────────────────────
 // JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
-bool relayActive = false;
+// relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
+bool relayActive[RELAY_COUNT] = {};
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
@@ -158,7 +182,7 @@ void updatePipelineSimValues() {
 
   if (pipelineScenario == "burst") {
     sim_pipeline_pressure = max(0.0f, 0.25f + p_noise * 0.4f);
-    sim_pipeline_flow     = relayActive
+    sim_pipeline_flow     = relayActive[0]
       ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
       : 0.0f;
 
@@ -461,7 +485,8 @@ void postDeviceInfo() {
   json += "\"flash_size_mb\":" + String(ESP.getFlashChipSize() / (1024 * 1024)) + ",";
   json += "\"sdk_version\":\""  + String(ESP.getSdkVersion()) + "\",";
   json += "\"mac_address\":\""  + WiFi.macAddress() + "\",";
-  json += "\"ip_address\":\""   + WiFi.localIP().toString() + "\"";
+  json += "\"ip_address\":\""   + WiFi.localIP().toString() + "\",";
+  json += "\"relay_count\":"    + String(RELAY_COUNT);
   json += "}";
 
   String url = "https://" + String(server_ip) + "/api/device_info";
@@ -508,20 +533,28 @@ String httpGet(const String& url, int timeoutMs = 10000) {
 }
 
 void checkRelayCommand() {
-  String url = "https://" + String(server_ip) + "/api/relay/command";
-  String response = httpGet(url, 2000);  // timeout corto — respuesta rápida
-  if (response == "1" && !relayActive) {
-    relayActive = true;
-    digitalWrite(RELAY_PIN, HIGH);  // HIGH = relay ON (activo-HIGH)
-    Serial.println("[Relay] ON — valvula abierta");
-    // ACK inmediato: el dashboard no necesita esperar el ciclo de 20s
-    httpPost("https://" + String(server_ip) + "/api/relay/ack", "1");
-  } else if (response == "0" && relayActive) {
-    relayActive = false;
-    digitalWrite(RELAY_PIN, LOW);   // LOW = relay OFF
-    Serial.println("[Relay] OFF — valvula cerrada");
-    // ACK inmediato
-    httpPost("https://" + String(server_ip) + "/api/relay/ack", "0");
+  String url = "https://" + String(server_ip)
+               + "/api/relay/command?mac=" + WiFi.macAddress();
+  String response = httpGet(url, 2000);
+  if (response.length() == 0) return;
+
+  int bitmask = response.toInt();
+  bool changed = false;
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    bool desired = (bitmask >> i) & 1;
+    if (desired != relayActive[i]) {
+      relayActive[i] = desired;
+      digitalWrite(RELAY_PINS[i], desired ? HIGH : LOW);
+      Serial.printf("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
+      changed = true;
+    }
+  }
+  if (changed) {
+    int actualMask = 0;
+    for (int i = 0; i < RELAY_COUNT; i++) {
+      if (relayActive[i]) actualMask |= (1 << i);
+    }
+    httpPost("https://" + String(server_ip) + "/api/relay/ack", String(actualMask));
   }
 }
 
@@ -769,10 +802,12 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LED_OFF);
 
-  // Relay — arrancar siempre en OFF (seguro)
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);   // LOW = relay OFF (activo-HIGH)
-  Serial.println("Relay OFF (inicio seguro)");
+  // Relay(s) — arrancar siempre en OFF (seguro)
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], LOW);
+  }
+  Serial.printf("%d relay(s) inicializados en OFF\n", RELAY_COUNT);
 
 #ifdef HAS_DISPLAY
   tft.init();
@@ -1097,7 +1132,7 @@ void loop() {
                    String(WiFi.RSSI())          + "," +
                    String((long)ESP.getFreeHeap()) + "," +
                    String((long)(millis() / 1000)) + "," +
-                   String(relayActive ? 1 : 0);
+                   String([&](){ int m=0; for(int i=0;i<RELAY_COUNT;i++) if(relayActive[i]) m|=(1<<i); return m; }());
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
