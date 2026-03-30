@@ -29,8 +29,8 @@
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
   #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — conflicto con RELAY_PIN_3 en PROFILE_IRRIGATION
-  #define SOIL_RAW_DRY   4094   // ADC en aire (seco)
-  #define SOIL_RAW_WET   3530   // ADC en agua (saturado)
+  #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
+  #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
   #define HAS_DISPLAY
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
@@ -91,7 +91,7 @@ const int ledPin = 2;
 // ── Intervalos ─────────────────────────────────────────────────────────────────
 #define WIND_MS       100
 #define SCREEN_MS    1000
-#define SEND_MS     20000
+#define SEND_MS      2000
 #define RELAY_MS     2000   // Consulta estado relay cada 2s para respuesta casi inmediata
 
 #ifdef HAS_DISPLAY
@@ -814,6 +814,14 @@ void setup() {
     digitalWrite(RELAY_PINS[i], LOW);
   }
   Serial.printf("%d relay(s) inicializados en OFF\n", RELAY_COUNT);
+
+#if defined(ESP32) && !defined(ESP8266)
+  // YL-69 — configurar GPIO 33 explícitamente como entrada analógica
+  // con atenuación 11dB (rango 0–3.3V → valores 0–4095)
+  pinMode(SOIL_PIN, INPUT);
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+  Serial.printf("SOIL GPIO%d configurado como ADC entrada (11dB)\n", SOIL_PIN);
+#endif
 
 #ifdef HAS_DISPLAY
   tft.init();
