@@ -28,6 +28,7 @@
   #define ADC_RANGE        4096.0f
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
+  #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — conflicto con RELAY_PIN_3 en PROFILE_IRRIGATION
   #define HAS_DISPLAY
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
@@ -132,6 +133,7 @@ float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
 float  currentWindDirDeg = 0;
 float  lightLevel        = 0;
+float  soilMoisture      = 0;   // YL-69 — humedad suelo (0=seco, 100=saturado)
 
 // ── Valores simulados (drift lento) ───────────────────────────────────────────
 float sim_tempMCP   = 20.5f;
@@ -142,7 +144,8 @@ float sim_humDHT11  = 60.0f;
 float sim_pressure  = 101.3f;
 float sim_light     = 300.0f;
 float sim_windSpeed = 3.5f;
-float sim_windDir   = 180.0f;
+float sim_windDir        = 180.0f;
+float sim_soilMoisture   = 50.0f;
 
 // ── Pipeline simulado ─────────────────────────────────────────────────────────
 String pipelineScenario      = "normal";  // actualizado desde el servidor cada 20s
@@ -163,7 +166,8 @@ void updateSimulatedValues() {
   sim_pressure  = driftClamp(sim_pressure,   95.0f, 110.0f,  0.02f);
   sim_light     = driftClamp(sim_light,       0.0f, 2000.0f, 5.0f);
   sim_windSpeed = driftClamp(sim_windSpeed,   0.0f,   15.0f, 0.3f);
-  sim_windDir   = fmod(sim_windDir + ((float)random(-10, 11) / 10.0f) * 5.0f + 360.0f, 360.0f);
+  sim_windDir        = fmod(sim_windDir + ((float)random(-10, 11) / 10.0f) * 5.0f + 360.0f, 360.0f);
+  sim_soilMoisture   = driftClamp(sim_soilMoisture, 0.0f, 100.0f, 0.5f);
 }
 
 // ── Pipeline simulator ────────────────────────────────────────────────────────
@@ -883,6 +887,15 @@ void setup() {
     lightLevel = sim_light;
   }
 
+#ifndef ESP8266
+  // YL-69 — humedad suelo (GPIO 33, ADC1_CH5). No requiere init; ADC_11db por defecto.
+  {
+    int raw = analogRead(SOIL_PIN);
+    soilMoisture = constrain((1.0f - (float)raw / ADC_RANGE) * 100.0f, 0.0f, 100.0f);
+    Serial.printf("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
+  }
+#endif
+
 #ifdef ESP8266
   Serial.println("Plataforma: ESP8266 (sin pantalla, sin veleta)");
 #else
@@ -1078,15 +1091,25 @@ void loop() {
     }
     if (!tsl_ok) lightLevel = sim_light;
 
+#ifndef ESP8266
+    // YL-69 — humedad suelo (GPIO 33)
+    {
+      int raw = analogRead(SOIL_PIN);
+      soilMoisture = constrain((1.0f - (float)raw / ADC_RANGE) * 100.0f, 0.0f, 100.0f);
+    }
+#else
+    soilMoisture = sim_soilMoisture;
+#endif
+
     updateSimulatedValues();
 
 #ifdef HAS_DISPLAY
     drawScreen();
 #else
-    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f\n",
+    Serial.printf("[1s] T:%.1f Tb:%.1f H:%.1f D11T:%.1f D11H:%.1f P:%.2f W:%.2f D:%.0f Lux:%.1f Soil:%.1f%%\n",
       temperatureMCP, temperatureDHT, humidity,
       temperatureDHT11, humidityDHT11,
-      (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel);
+      (float)pressure, windSpeedFiltered, currentWindDirDeg, lightLevel, soilMoisture);
 #endif
 
     lastScreenTime = now;
@@ -1114,10 +1137,10 @@ void loop() {
       digitalWrite(ledPin, LED_ON);
 
       String url = "https://" + String(server_ip) + "/send_message";
-      // CSV: 15 valores — temperatura, presion, temp_bar, humedad,
+      // CSV: 16 valores — temperatura, presion, temp_bar, humedad,
       //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
       //                    dht11_temperatura, dht11_humedad,
-      //                    rssi, free_heap, uptime_s, relay_active
+      //                    rssi, free_heap, uptime_s, relay_active, soil_moisture
       String msg = String(temperatureMCP, 2)    + "," +
                    String(pressure, 2)          + "," +
                    String(temperatureDHT, 2)    + "," +
@@ -1132,7 +1155,8 @@ void loop() {
                    String(WiFi.RSSI())          + "," +
                    String((long)ESP.getFreeHeap()) + "," +
                    String((long)(millis() / 1000)) + "," +
-                   String([&](){ int m=0; for(int i=0;i<RELAY_COUNT;i++) if(relayActive[i]) m|=(1<<i); return m; }());
+                   String([&](){ int m=0; for(int i=0;i<RELAY_COUNT;i++) if(relayActive[i]) m|=(1<<i); return m; }()) + "," +
+                   String(soilMoisture, 2);
 
       Serial.println("TX: " + msg);
       ok = httpPost(url, msg);
