@@ -29,6 +29,8 @@
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
   #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — conflicto con RELAY_PIN_3 en PROFILE_IRRIGATION
+  #define SOIL_RAW_DRY   4094   // ADC en aire (seco)
+  #define SOIL_RAW_WET   3530   // ADC en agua (saturado)
   #define HAS_DISPLAY
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
@@ -888,10 +890,13 @@ void setup() {
   }
 
 #ifndef ESP8266
-  // YL-69 — humedad suelo (GPIO 33, ADC1_CH5). No requiere init; ADC_11db por defecto.
+  // YL-69 — humedad suelo (GPIO 33, ADC1_CH5). Calibrado: 4094=seco, 3530=saturado.
   {
     int raw = analogRead(SOIL_PIN);
-    soilMoisture = constrain((1.0f - (float)raw / ADC_RANGE) * 100.0f, 0.0f, 100.0f);
+    soilMoisture = constrain(
+      (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
+      0.0f, 100.0f
+    );
     Serial.printf("YL-69 OK — suelo: %.1f %% (ADC raw=%d)\n", soilMoisture, raw);
   }
 #endif
@@ -1092,10 +1097,13 @@ void loop() {
     if (!tsl_ok) lightLevel = sim_light;
 
 #ifndef ESP8266
-    // YL-69 — humedad suelo (GPIO 33)
+    // YL-69 — humedad suelo (GPIO 33), calibrado
     {
       int raw = analogRead(SOIL_PIN);
-      soilMoisture = constrain((1.0f - (float)raw / ADC_RANGE) * 100.0f, 0.0f, 100.0f);
+      soilMoisture = constrain(
+        (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
+        0.0f, 100.0f
+      );
     }
 #else
     soilMoisture = sim_soilMoisture;

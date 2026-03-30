@@ -51,7 +51,7 @@ echo ""
 
 # ── Verificar conectividad ─────────────────────────────────────────────────────
 echo -n "Comprobando conexión con ${ESP_IP}... "
-if ping -c 1 -W 2 "$ESP_IP" > /dev/null 2>&1; then
+if ping -c 1 -W 2 "$ESP_IP" > /dev/null 2>&1 || ping -n 1 -w 2000 "$ESP_IP" > /dev/null 2>&1; then
     echo "OK"
 else
     echo "FALLO"
