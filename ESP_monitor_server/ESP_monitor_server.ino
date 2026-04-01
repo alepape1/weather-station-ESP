@@ -449,6 +449,14 @@ const char* degToCompass(float d) {
   return dirs[((int)(d + 22.5f) / 45) % 8];
 }
 
+// ── FreeRTOS (solo ESP32) — declarado aquí para estar disponible antes de su uso ──
+#ifndef ESP8266
+volatile bool        isUpdatingOTA = false;
+portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t    dataMutex     = nullptr;
+TaskHandle_t         networkTaskHandle = nullptr;
+#endif
+
 // ── Promedio vectorial de dirección ────────────────────────────────────────────
 float windSumX = 0, windSumY = 0;
 int   windSampleCount = 0;
@@ -492,13 +500,6 @@ bool lastServerOK    = false;
 unsigned long lastSendTime   = 0;
 unsigned long lastScreenTime = 0;
 
-// ── FreeRTOS (solo ESP32) ─────────────────────────────────────────────────────
-#ifndef ESP8266
-volatile bool        isUpdatingOTA = false;
-portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
-SemaphoreHandle_t    dataMutex     = nullptr;
-TaskHandle_t         networkTaskHandle = nullptr;
-#endif
 
 // ── Info estática del hardware ────────────────────────────────────────────────
 void printHardwareInfo() {
