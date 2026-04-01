@@ -1,41 +1,55 @@
 #!/bin/bash
-# ota_flash.sh — Compila el sketch con arduino-cli y flashea el ESP32 por OTA
+# ota_flash.sh — Compila el sketch con arduino-cli y flashea los ESP32 por OTA
 #
 # Uso:
-#   ./ota_flash.sh                        → compila + flashea (IP por defecto 192.168.1.9)
-#   ./ota_flash.sh 192.168.1.X            → compila + flashea a IP personalizada
-#   ./ota_flash.sh --upload-only          → solo flashea el último .bin compilado
-#   ./ota_flash.sh --upload-only 192.168.1.X → idem con IP personalizada
+#   ./ota_flash.sh                    → compila + flashea METEO (192.168.1.9)
+#   ./ota_flash.sh --meteo            → compila + flashea LilyGo TTGO (PROFILE_METEO)
+#   ./ota_flash.sh --irrigation       → compila + flashea 4-Relay Board (PROFILE_IRRIGATION)
+#   ./ota_flash.sh --all              → compila + flashea ambos dispositivos
+#   ./ota_flash.sh --upload-only      → solo flashea el .bin ya compilado (METEO)
+#   ./ota_flash.sh --upload-only --irrigation → idem para IRRIGATION
+#   Cualquier argumento IP sobreescribe la IP por defecto del perfil seleccionado.
 
 set -e
 
-# ── Parseo de argumentos ───────────────────────────────────────────────────────
-COMPILE=true
-ESP_IP="192.168.1.9"
-for arg in "$@"; do
-    if [[ "$arg" == "--upload-only" ]]; then
-        COMPILE=false
-    elif [[ "$arg" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        ESP_IP="$arg"
-    fi
-done
+# ── Configuración de perfiles ──────────────────────────────────────────────────
+# METEO    → LilyGo TTGO T-Display (pantalla ST7789, 1 relay)
+# IRRIGATION → ESP32 4-Relay Board (ESP32-WROOM-32E, 4 relays, sin pantalla)
+METEO_IP="192.168.1.9"
+METEO_FQBN="esp32:esp32:lilygo_t_display"
+METEO_PROFILE=1
+
+IRRIGATION_IP="192.168.1.11"
+IRRIGATION_FQBN="esp32:esp32:esp32"
+IRRIGATION_PROFILE=2
 
 ESP_PORT=3232
-FQBN="esp32:esp32:lilygo_t_display"
 SKETCH_DIR="$(cd "$(dirname "$0")/ESP_monitor_server" && pwd)"
 SKETCH="ESP_monitor_server"
 
+# ── Parseo de argumentos ───────────────────────────────────────────────────────
+COMPILE=true
+MODE="meteo"          # meteo | irrigation | all
+CUSTOM_IP=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --upload-only)   COMPILE=false ;;
+        --meteo)         MODE="meteo" ;;
+        --irrigation)    MODE="irrigation" ;;
+        --all)           MODE="all" ;;
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*)  CUSTOM_IP="$arg" ;;
+    esac
+done
+
 # ── Detección de OS y rutas ────────────────────────────────────────────────────
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || -n "$WINDIR" ]]; then
-    # Windows (Git Bash / MSYS2)
-    BUILD_DIR="$LOCALAPPDATA/Temp/esp_ota_build"
+    BASE_BUILD_DIR="$LOCALAPPDATA/Temp/esp_ota_build"
     ARDUINO_CLI="/c/Program Files/Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe"
     PYTHON="/c/Users/Perfilador ResCoast/AppData/Local/Programs/Python/Python312/python.exe"
     ARDUINO15="$LOCALAPPDATA/Arduino15"
 else
-    # Linux / macOS
-    BUILD_DIR="/tmp/esp_ota_build"
-    # arduino-cli: buscar en rutas comunes
+    BASE_BUILD_DIR="/tmp/esp_ota_build"
     if command -v arduino-cli &>/dev/null; then
         ARDUINO_CLI="arduino-cli"
     elif [ -f "$HOME/.local/bin/arduino-cli" ]; then
@@ -47,7 +61,6 @@ else
         echo "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh"
         exit 1
     fi
-    # Python 3
     if command -v python3 &>/dev/null; then
         PYTHON="python3"
     else
@@ -55,8 +68,6 @@ else
     fi
     ARDUINO15="$HOME/.arduino15"
 fi
-
-BIN="${BUILD_DIR}/${SKETCH}.ino.bin"
 
 # espota.py — detecta la versión del core ESP32 instalada automáticamente
 ESP32_VER=$(ls "$ARDUINO15/packages/esp32/hardware/esp32/" 2>/dev/null | sort -V | tail -1)
@@ -67,50 +78,116 @@ if [ -z "$ESP32_VER" ]; then
 fi
 ESPOTA="$ARDUINO15/packages/esp32/hardware/esp32/${ESP32_VER}/tools/espota.py"
 
+# ── Funciones ──────────────────────────────────────────────────────────────────
+
+check_ping() {
+    local ip="$1"
+    if ping -c 1 -W 2 "$ip" > /dev/null 2>&1 || ping -n 1 -w 2000 "$ip" > /dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+compile_profile() {
+    local profile_name="$1"   # "METEO" o "IRRIGATION"
+    local fqbn="$2"
+    local profile_num="$3"
+    local build_dir="${BASE_BUILD_DIR}_${profile_name,,}"
+
+    echo ""
+    echo "┌─ Compilando ${profile_name} ──────────────────────────────────────"
+    echo "│  FQBN           : ${fqbn}"
+    echo "│  DEVICE_PROFILE : ${profile_num}"
+    echo "│  Build dir      : ${build_dir}"
+    echo "└───────────────────────────────────────────────────────────────────"
+    mkdir -p "$build_dir"
+    "$ARDUINO_CLI" compile \
+        --fqbn "$fqbn" \
+        --build-path "$build_dir" \
+        --build-property "compiler.cpp.extra_flags=-DDEVICE_PROFILE=${profile_num}" \
+        "$SKETCH_DIR"
+    echo "Compilación ${profile_name} completada."
+}
+
+flash_device() {
+    local profile_name="$1"
+    local ip="$2"
+    local build_dir="${BASE_BUILD_DIR}_${profile_name,,}"
+    local bin="${build_dir}/${SKETCH}.ino.bin"
+
+    if [ ! -f "$bin" ]; then
+        echo "ERROR: No se encontró el .bin para ${profile_name} en ${build_dir}"
+        echo "Compila primero sin --upload-only"
+        exit 1
+    fi
+
+    local bin_size
+    bin_size=$(du -h "$bin" | cut -f1)
+
+    echo ""
+    echo "┌─ Flasheando ${profile_name} → ${ip}:${ESP_PORT} ─────────────────"
+    echo "│  Firmware : ${bin} (${bin_size})"
+    echo "└───────────────────────────────────────────────────────────────────"
+
+    echo -n "Comprobando conexión con ${ip}... "
+    if check_ping "$ip"; then
+        echo "OK"
+    else
+        echo "FALLO"
+        echo "El ESP32 (${profile_name}) no responde en ${ip}."
+        echo "Comprueba que está encendido y conectado a la red."
+        exit 1
+    fi
+
+    echo "Iniciando carga OTA..."
+    "$PYTHON" "$ESPOTA" -i "$ip" -p "$ESP_PORT" -f "$bin"
+    echo "${profile_name} flasheado. El ESP32 se reiniciará automáticamente."
+}
+
+# ── Ejecución ──────────────────────────────────────────────────────────────────
 echo "=== MeteoStation OTA Flash ==="
-echo "Target  : ${ESP_IP}:${ESP_PORT}"
-echo "Board   : ${FQBN}"
+echo "Modo    : ${MODE}"
 echo "Sketch  : ${SKETCH_DIR}"
 echo "Core    : esp32 ${ESP32_VER}"
+
+case "$MODE" in
+
+    meteo)
+        IP="${CUSTOM_IP:-$METEO_IP}"
+        if [ "$COMPILE" = true ]; then
+            compile_profile "METEO" "$METEO_FQBN" "$METEO_PROFILE"
+        else
+            echo "Compilación omitida (--upload-only)"
+        fi
+        flash_device "METEO" "$IP"
+        ;;
+
+    irrigation)
+        IP="${CUSTOM_IP:-$IRRIGATION_IP}"
+        if [ "$COMPILE" = true ]; then
+            compile_profile "IRRIGATION" "$IRRIGATION_FQBN" "$IRRIGATION_PROFILE"
+        else
+            echo "Compilación omitida (--upload-only)"
+        fi
+        flash_device "IRRIGATION" "$IP"
+        ;;
+
+    all)
+        if [ -n "$CUSTOM_IP" ]; then
+            echo "AVISO: IP personalizada ignorada en modo --all. Usa --meteo o --irrigation."
+        fi
+        if [ "$COMPILE" = true ]; then
+            compile_profile "METEO"      "$METEO_FQBN"      "$METEO_PROFILE"
+            compile_profile "IRRIGATION" "$IRRIGATION_FQBN" "$IRRIGATION_PROFILE"
+        else
+            echo "Compilación omitida (--upload-only)"
+        fi
+        flash_device "METEO"      "$METEO_IP"
+        flash_device "IRRIGATION" "$IRRIGATION_IP"
+        echo ""
+        echo "=== Ambos dispositivos actualizados ==="
+        ;;
+esac
+
 echo ""
-
-# ── Compilar ──────────────────────────────────────────────────────────────────
-if [ "$COMPILE" = true ]; then
-    echo "Compilando con arduino-cli..."
-    mkdir -p "$BUILD_DIR"
-    "$ARDUINO_CLI" compile \
-        --fqbn "$FQBN" \
-        --build-path "$BUILD_DIR" \
-        "$SKETCH_DIR"
-else
-    echo "Compilación omitida (--upload-only)"
-fi
-
-if [ ! -f "$BIN" ]; then
-    echo "ERROR: No se encontró el .bin en ${BUILD_DIR}"
-    echo "Compila primero sin --upload-only"
-    exit 1
-fi
-
-BIN_SIZE=$(du -h "$BIN" | cut -f1)
-echo ""
-echo "Firmware compilado: ${BIN} (${BIN_SIZE})"
-echo ""
-
-# ── Verificar conectividad ─────────────────────────────────────────────────────
-echo -n "Comprobando conexión con ${ESP_IP}... "
-if ping -c 1 -W 2 "$ESP_IP" > /dev/null 2>&1 || ping -n 1 -w 2000 "$ESP_IP" > /dev/null 2>&1; then
-    echo "OK"
-else
-    echo "FALLO"
-    echo "El ESP32 no responde. Comprueba que está encendido y en la red."
-    exit 1
-fi
-
-# ── Flash OTA ─────────────────────────────────────────────────────────────────
-echo ""
-echo "Iniciando carga OTA..."
-"$PYTHON" "$ESPOTA" -i "$ESP_IP" -p "$ESP_PORT" -f "$BIN"
-
-echo ""
-echo "Listo. El ESP32 se reiniciará automáticamente."
+echo "Listo."

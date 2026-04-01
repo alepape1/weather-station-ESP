@@ -21,6 +21,7 @@
   #include <HTTPClient.h>
   #include <WiFiClientSecure.h>
   #include <ArduinoOTA.h>
+  #include "driver/rtc_io.h" // Añade esto al principio del archivo
   #define I2C_SDA          21
   #define I2C_SCL          22
   #define DHTPIN           15
@@ -28,9 +29,11 @@
   #define ADC_RANGE        4096.0f
   #define ANEMOMETER_PIN   37
   #define VANE_PIN         36
-  #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — conflicto con RELAY_PIN_3 en PROFILE_IRRIGATION
-  #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
-  #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
+  #if DEVICE_PROFILE == PROFILE_METEO
+    #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
+    #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
+    #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
+  #endif
   #define HAS_DISPLAY
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
@@ -47,6 +50,7 @@
 #include <Adafruit_MCP9808.h>
 #include <SparkFun_MicroPressure.h>
 #include <DHTesp.h>
+#include <ArduinoJson.h>
 #include <math.h>
 #include "secrets.h"
 
@@ -61,10 +65,11 @@
 #if DEVICE_PROFILE == PROFILE_IRRIGATION
   #define RELAY_COUNT 4
   #ifndef RELAY_PIN_1
-    #define RELAY_PIN_1 26
-    #define RELAY_PIN_2 25
-    #define RELAY_PIN_3 33
-    #define RELAY_PIN_4 32
+    // ESP32 4-Relay Board (ESPHome): GPIO32/33/25/26, LED status GPIO23
+    #define RELAY_PIN_1 32
+    #define RELAY_PIN_2 33
+    #define RELAY_PIN_3 25
+    #define RELAY_PIN_4 26
   #endif
   static const uint8_t RELAY_PINS[RELAY_COUNT] = {RELAY_PIN_1, RELAY_PIN_2,
                                                    RELAY_PIN_3, RELAY_PIN_4};
@@ -391,10 +396,11 @@ float tsl_readLux() {
   return max(0.0f, lux);
 }
 
-// ── Filtro media móvil (velocidad viento) ──────────────────────────────────────
+// ── Filtros media móvil ────────────────────────────────────────────────────────
 #define FILTER_SIZE 10
-int anemometerValues[FILTER_SIZE] = {};
-int aneIdx = 0;
+
+int   anemometerValues[FILTER_SIZE] = {};
+int   aneIdx = 0;
 
 float filteredADC(int newVal) {
   anemometerValues[aneIdx] = newVal;
@@ -403,6 +409,19 @@ float filteredADC(int newVal) {
   for (int i = 0; i < FILTER_SIZE; i++) s += anemometerValues[i];
   return (float)s / FILTER_SIZE;
 }
+
+#if defined(SOIL_PIN)
+int   soilValues[FILTER_SIZE] = {};
+int   soilIdx = 0;
+
+float filteredSoilADC(int newVal) {
+  soilValues[soilIdx] = newVal;
+  soilIdx = (soilIdx + 1) % FILTER_SIZE;
+  long s = 0;
+  for (int i = 0; i < FILTER_SIZE; i++) s += soilValues[i];
+  return (float)s / FILTER_SIZE;
+}
+#endif
 
 float adcToWindSpeed(float adc) {
   float v = adc * (ADC_VOLTAGE_REF / ADC_RANGE);
@@ -437,17 +456,34 @@ float finalAvgWindDir = 0;
 
 void accumulateWindVector(float deg) {
   float r = deg * PI / 180.0f;
+#ifndef ESP8266
+  portENTER_CRITICAL(&windMux);
+#endif
   windSumX += cos(r);
   windSumY += sin(r);
   windSampleCount++;
+#ifndef ESP8266
+  portEXIT_CRITICAL(&windMux);
+#endif
 }
 
 float calcAndResetWindVector() {
-  if (windSampleCount == 0) return 0;
+#ifndef ESP8266
+  portENTER_CRITICAL(&windMux);
+#endif
+  if (windSampleCount == 0) {
+#ifndef ESP8266
+    portEXIT_CRITICAL(&windMux);
+#endif
+    return 0;
+  }
   float deg = atan2(windSumY, windSumX) * 180.0f / PI;
   if (deg < 0) deg += 360.0f;
   windSumX = windSumY = 0;
   windSampleCount = 0;
+#ifndef ESP8266
+  portEXIT_CRITICAL(&windMux);
+#endif
   return deg;
 }
 
@@ -455,6 +491,14 @@ float calcAndResetWindVector() {
 bool lastServerOK    = false;
 unsigned long lastSendTime   = 0;
 unsigned long lastScreenTime = 0;
+
+// ── FreeRTOS (solo ESP32) ─────────────────────────────────────────────────────
+#ifndef ESP8266
+volatile bool        isUpdatingOTA = false;
+portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t    dataMutex     = nullptr;
+TaskHandle_t         networkTaskHandle = nullptr;
+#endif
 
 // ── Info estática del hardware ────────────────────────────────────────────────
 void printHardwareInfo() {
@@ -474,26 +518,23 @@ void printHardwareInfo() {
 }
 
 void postDeviceInfo() {
-  String chipModel;
-  int    chipRevision;
+  JsonDocument doc;
 #ifdef ESP8266
-  chipModel    = "ESP8266";
-  chipRevision = 0;
+  doc["chip_model"]    = "ESP8266";
+  doc["chip_revision"] = 0;
 #else
-  chipModel    = String(ESP.getChipModel());
-  chipRevision = (int)ESP.getChipRevision();
+  doc["chip_model"]    = ESP.getChipModel();
+  doc["chip_revision"] = (int)ESP.getChipRevision();
 #endif
+  doc["cpu_freq_mhz"]  = ESP.getCpuFreqMHz();
+  doc["flash_size_mb"] = ESP.getFlashChipSize() / (1024 * 1024);
+  doc["sdk_version"]   = ESP.getSdkVersion();
+  doc["mac_address"]   = WiFi.macAddress();
+  doc["ip_address"]    = WiFi.localIP().toString();
+  doc["relay_count"]   = RELAY_COUNT;
 
-  String json = "{";
-  json += "\"chip_model\":\""  + chipModel + "\",";
-  json += "\"chip_revision\":" + String(chipRevision) + ",";
-  json += "\"cpu_freq_mhz\":"  + String(ESP.getCpuFreqMHz()) + ",";
-  json += "\"flash_size_mb\":" + String(ESP.getFlashChipSize() / (1024 * 1024)) + ",";
-  json += "\"sdk_version\":\""  + String(ESP.getSdkVersion()) + "\",";
-  json += "\"mac_address\":\""  + WiFi.macAddress() + "\",";
-  json += "\"ip_address\":\""   + WiFi.localIP().toString() + "\",";
-  json += "\"relay_count\":"    + String(RELAY_COUNT);
-  json += "}";
+  String json;
+  serializeJson(doc, json);
 
   String url = "https://" + String(server_ip) + "/api/device_info";
 #ifdef ESP8266
@@ -550,7 +591,8 @@ void checkRelayCommand() {
     bool desired = (bitmask >> i) & 1;
     if (desired != relayActive[i]) {
       relayActive[i] = desired;
-      digitalWrite(RELAY_PINS[i], desired ? HIGH : LOW);
+      // JQC-3FF-S-Z activo-LOW: LOW = relay ON, HIGH = relay OFF
+      digitalWrite(RELAY_PINS[i], desired ? LOW : HIGH);
       Serial.printf("[Relay %d] %s\n", i, desired ? "ON" : "OFF");
       changed = true;
     }
@@ -779,6 +821,101 @@ void drawBootScreen(const char* wifiMsg) {
 #endif  // HAS_DISPLAY
 
 // =============================================================================
+// TAREA DE RED — Core 0 (solo ESP32)
+// Gestiona OTA, relay polling y HTTP POST sin bloquear sensores/display (Core 1)
+// =============================================================================
+#ifndef ESP8266
+void networkTask(void* pvParameters) {
+  static bool   deviceInfoSent = false;
+  static unsigned long lastRelayCheck = 0;
+  static unsigned long lastSendTime   = 0;
+
+  for (;;) {
+    ArduinoOTA.handle();  // siempre primero, alta frecuencia
+
+    if (isUpdatingOTA) {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    unsigned long now = millis();
+
+    // Device info — una sola vez tras conectar
+    if (!deviceInfoSent) {
+      postDeviceInfo();
+      deviceInfoSent = true;
+    }
+
+    // Relay poll cada 2s
+    if (now - lastRelayCheck >= RELAY_MS) {
+      checkRelayCommand();
+      lastRelayCheck = now;
+    }
+
+    // HTTP POST cada 20s — captura snapshot con mutex
+    if (now - lastSendTime >= SEND_MS) {
+      // Snapshot de valores sensor bajo mutex (lectura atómica)
+      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
+      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
+      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
+      long  snap_heap;
+      int   snap_rssi;
+      long  snap_uptime;
+      int   snap_relayMask = 0;
+
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        snap_tempMCP       = temperatureMCP;
+        snap_pressure      = (float)pressure;
+        snap_tempDHT       = temperatureDHT;
+        snap_humidity      = humidity;
+        snap_windSpeed     = windSpeed;
+        snap_windDir       = currentWindDirDeg;
+        snap_windSpeedFilt = windSpeedFiltered;
+        snap_avgWindDir    = calcAndResetWindVector();
+        snap_light         = lightLevel;
+        snap_tempDHT11     = temperatureDHT11;
+        snap_humDHT11      = humidityDHT11;
+        snap_soil          = soilMoisture;
+        snap_heap          = (long)ESP.getFreeHeap();
+        snap_rssi          = WiFi.RSSI();
+        snap_uptime        = (long)(millis() / 1000);
+        for (int i = 0; i < RELAY_COUNT; i++)
+          if (relayActive[i]) snap_relayMask |= (1 << i);
+        xSemaphoreGive(dataMutex);
+      }
+
+      String url = "https://" + String(server_ip) + "/send_message";
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
+        snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity,
+        snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir,
+        snap_light, snap_tempDHT11, snap_humDHT11,
+        snap_rssi, snap_heap, snap_uptime, snap_relayMask, snap_soil
+      );
+
+      Serial.printf("[NET] TX: %s\n", msg);
+      digitalWrite(ledPin, LED_ON);
+      bool ok = httpPost(url, String(msg));
+      digitalWrite(ledPin, LED_OFF);
+      Serial.printf("[NET] HTTP %s\n", ok ? "200 OK" : "ERROR");
+
+      lastServerOK = ok;
+      lastSendTime = now;
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+#endif
+
+// =============================================================================
 // SETUP
 // =============================================================================
 void setup() {
@@ -809,20 +946,21 @@ void setup() {
   digitalWrite(ledPin, LED_OFF);
 
   // Relay(s) — arrancar siempre en OFF (seguro)
+  // JQC-3FF-S-Z activo-LOW: HIGH = relay OFF (válvula cerrada)
   for (int i = 0; i < RELAY_COUNT; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], LOW);
+    digitalWrite(RELAY_PINS[i], HIGH);  // HIGH = OFF para relay activo-LOW
   }
-  Serial.printf("%d relay(s) inicializados en OFF\n", RELAY_COUNT);
+  Serial.printf("%d relay(s) inicializados en OFF (HIGH)\n", RELAY_COUNT);
 
 #if defined(ESP32) && !defined(ESP8266)
-  // YL-69 — configurar GPIO 33 explícitamente como entrada analógica
-  // con atenuación 11dB (rango 0–3.3V → valores 0–4095)
-  pinMode(SOIL_PIN, INPUT);
+  analogReadResolution(12);
+  #if defined(SOIL_PIN)
+  pinMode(SOIL_PIN, ANALOG);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
-  Serial.printf("SOIL GPIO%d configurado como ADC entrada (11dB)\n", SOIL_PIN);
+  Serial.printf("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
+  #endif
 #endif
-
 #ifdef HAS_DISPLAY
   tft.init();
   tft.setRotation(1);
@@ -897,10 +1035,11 @@ void setup() {
     lightLevel = sim_light;
   }
 
-#ifndef ESP8266
-  // YL-69 — humedad suelo (GPIO 33, ADC1_CH5). Calibrado: 4094=seco, 3530=saturado.
+#if defined(SOIL_PIN)
   {
     int raw = analogRead(SOIL_PIN);
+    // Precalentar el filtro con la lectura inicial
+    for (int i = 0; i < FILTER_SIZE; i++) soilValues[i] = raw;
     soilMoisture = constrain(
       (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
       0.0f, 100.0f
@@ -946,18 +1085,46 @@ void setup() {
     ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
     ArduinoOTA.onStart([]() {
-      Serial.println("\n[OTA] Inicio de actualización");
+      isUpdatingOTA = true;
+      String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+      Serial.printf("\n[OTA] Inicio de actualización (%s) — relays a OFF por seguridad\n", type.c_str());
+      // Apagar todos los relays por seguridad durante el flash
+      for (int i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAY_PINS[i], HIGH);
     });
     ArduinoOTA.onEnd([]() {
       Serial.println("\n[OTA] Actualización completada — reiniciando");
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("[OTA] %u%%\r", progress * 100 / total);
+      Serial.printf("[OTA] %u%% (%u/%u bytes)\r", progress * 100 / total, progress, total);
     });
     ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("[OTA] Error %u\n", error);
+      isUpdatingOTA = false;
+      const char* msg = "Desconocido";
+      switch (error) {
+        case OTA_AUTH_ERROR:    msg = "Fallo de autenticacion";  break;
+        case OTA_BEGIN_ERROR:   msg = "Fallo al iniciar";        break;
+        case OTA_CONNECT_ERROR: msg = "Fallo de conexion";       break;
+        case OTA_RECEIVE_ERROR: msg = "Fallo al recibir datos";  break;
+        case OTA_END_ERROR:     msg = "Fallo al finalizar";      break;
+      }
+      Serial.printf("[OTA] ERROR %u: %s\n", error, msg);
     });
     ArduinoOTA.begin();
+
+#ifndef ESP8266
+    // FreeRTOS: crear tarea de red en Core 0
+    dataMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(
+      networkTask,        // función
+      "NetworkTask",      // nombre
+      8192,               // stack (bytes)
+      nullptr,            // parámetros
+      2,                  // prioridad (más alta que loop=1)
+      &networkTaskHandle, // handle
+      0                   // Core 0
+    );
+    Serial.println("NetworkTask creada en Core 0");
+#endif
     WiFi.setSleep(true);  // Modem Sleep: ahorra ~15-20mA entre transmisiones
     Serial.println("OTA listo — hostname: " +
 #ifdef ESP8266
@@ -986,10 +1153,13 @@ void setup() {
 }
 
 // =============================================================================
-// LOOP
+// LOOP — Core 1: sensores + display (sin red)
+// En ESP8266 incluye también la red (sin FreeRTOS).
 // =============================================================================
 void loop() {
-  ArduinoOTA.handle();  // OTA — debe ser lo primero del loop
+#ifdef ESP8266
+  ArduinoOTA.handle();
+#endif
 
   unsigned long now = millis();
 
@@ -1032,6 +1202,9 @@ void loop() {
 
   // ── 2. Sensores I2C (MCP9808, HTU2x, barometro, luz) + pantalla (cada 1s) ───
   if (now - lastScreenTime >= SCREEN_MS) {
+#ifndef ESP8266
+    bool hasMutex = (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+#endif
 
     // MCP9808
     if (mcp_ok) {
@@ -1104,12 +1277,12 @@ void loop() {
     }
     if (!tsl_ok) lightLevel = sim_light;
 
-#ifndef ESP8266
-    // YL-69 — humedad suelo (GPIO 33), calibrado
+#if defined(SOIL_PIN)
     {
       int raw = analogRead(SOIL_PIN);
+      float filtRaw = filteredSoilADC(raw);
       soilMoisture = constrain(
-        (float)(SOIL_RAW_DRY - raw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
+        (float)(SOIL_RAW_DRY - filtRaw) / (SOIL_RAW_DRY - SOIL_RAW_WET) * 100.0f,
         0.0f, 100.0f
       );
     }
@@ -1118,6 +1291,10 @@ void loop() {
 #endif
 
     updateSimulatedValues();
+
+#ifndef ESP8266
+    if (hasMutex) xSemaphoreGive(dataMutex);
+#endif
 
 #ifdef HAS_DISPLAY
     drawScreen();
@@ -1131,60 +1308,43 @@ void loop() {
     lastScreenTime = now;
   }
 
-  // ── 3. Relay (cada 2s) — respuesta casi inmediata al pulsar en el dashboard ───
-  static unsigned long lastRelayCheck = 0;
-  if (now - lastRelayCheck >= RELAY_MS && WiFi.status() == WL_CONNECTED) {
+#ifdef ESP8266
+  // ── ESP8266: red en el loop() (sin FreeRTOS) ─────────────────────────────────
+  static unsigned long lastRelayCheck8266 = 0;
+  if (now - lastRelayCheck8266 >= RELAY_MS && WiFi.status() == WL_CONNECTED) {
     checkRelayCommand();
-    lastRelayCheck = now;
+    lastRelayCheck8266 = now;
   }
 
-  // ── 4. Envío HTTP (cada 20s) ─────────────────────────────────────────────────
-  static bool deviceInfoSent = false;
-  if (!deviceInfoSent && WiFi.status() == WL_CONNECTED) {
+  static bool deviceInfoSent8266 = false;
+  if (!deviceInfoSent8266 && WiFi.status() == WL_CONNECTED) {
     postDeviceInfo();
-    deviceInfoSent = true;
+    deviceInfoSent8266 = true;
   }
 
-  if (now - lastSendTime >= SEND_MS) {
+  static unsigned long lastSendTime8266 = 0;
+  if (now - lastSendTime8266 >= SEND_MS) {
     finalAvgWindDir = calcAndResetWindVector();
     bool ok = false;
-
     if (WiFi.status() == WL_CONNECTED) {
-      digitalWrite(ledPin, LED_ON);
-
       String url = "https://" + String(server_ip) + "/send_message";
-      // CSV: 16 valores — temperatura, presion, temp_bar, humedad,
-      //                    viento, direccion, viento_filtrado, dir_filtrada, luz,
-      //                    dht11_temperatura, dht11_humedad,
-      //                    rssi, free_heap, uptime_s, relay_active, soil_moisture
-      String msg = String(temperatureMCP, 2)    + "," +
-                   String(pressure, 2)          + "," +
-                   String(temperatureDHT, 2)    + "," +
-                   String(humidity, 2)          + "," +
-                   String(windSpeed, 2)         + "," +
-                   String(currentWindDirDeg, 2) + "," +
-                   String(windSpeedFiltered, 2) + "," +
-                   String(finalAvgWindDir, 2)   + "," +
-                   String(lightLevel, 2)        + "," +
-                   String(temperatureDHT11, 2)  + "," +
-                   String(humidityDHT11, 2)     + "," +
-                   String(WiFi.RSSI())          + "," +
-                   String((long)ESP.getFreeHeap()) + "," +
-                   String((long)(millis() / 1000)) + "," +
-                   String([&](){ int m=0; for(int i=0;i<RELAY_COUNT;i++) if(relayActive[i]) m|=(1<<i); return m; }()) + "," +
-                   String(soilMoisture, 2);
-
-      Serial.println("TX: " + msg);
-      ok = httpPost(url, msg);
-      Serial.printf("HTTP %s\n", ok ? "200 OK" : "ERROR");
-      digitalWrite(ledPin, LED_OFF);
-
+      char msg[256];
+      int relayMask = 0;
+      for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
+      snprintf(msg, sizeof(msg),
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
+        temperatureMCP, (float)pressure, temperatureDHT, humidity,
+        windSpeed, currentWindDirDeg, windSpeedFiltered, finalAvgWindDir,
+        lightLevel, temperatureDHT11, humidityDHT11,
+        WiFi.RSSI(), (long)ESP.getFreeHeap(), (long)(millis()/1000),
+        relayMask, soilMoisture
+      );
+      ok = httpPost(url, String(msg));
     } else {
-      Serial.println("WiFi desconectado — intentando reconectar");
       WiFi.reconnect();
     }
-
     lastServerOK = ok;
-    lastSendTime = now;
+    lastSendTime8266 = now;
   }
+#endif
 }
