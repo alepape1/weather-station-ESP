@@ -54,6 +54,14 @@
 #include <math.h>
 #include "secrets.h"
 
+// PubSubClient y certificado TLS — solo ESP32 y solo cuando USE_MQTT está definido
+// IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
+#if !defined(ESP8266) && defined(USE_MQTT)
+  #include <PubSubClient.h>
+  #include "mqtt_cert.h"
+  #include <time.h>
+#endif
+
 // ── Perfiles de dispositivo (definir DEVICE_PROFILE en secrets.h) ─────────────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
@@ -88,6 +96,15 @@ const char* password    = WIFI_PASSWORD;
 const char* server_ip   = SERVER_IP;
 const int   server_port = SERVER_PORT;
 
+#ifdef USE_MQTT
+const char* mqtt_server = MQTT_SERVER;
+const int   mqtt_port   = MQTT_PORT;
+const char* finca_id    = FINCA_ID;
+const char* mqtt_user   = MQTT_USER;
+const char* mqtt_pass   = MQTT_PASS;
+#define MQTT_SEND_MS 20000UL
+#endif
+
 // ── Pines ─────────────────────────────────────────────────────────────────────
 const int ledPin = 2;
 #define LED_ON  LOW
@@ -121,6 +138,11 @@ DHTesp                 dht;
 // JQC-3FF-S-Z activo-LOW: LOW = relay ON (válvula abierta), HIGH = relay OFF
 // relayActive[i] — estado actual de cada relay (índice = bit en bitmask)
 bool relayActive[RELAY_COUNT] = {};
+
+#ifdef USE_MQTT
+static WiFiClientSecure mqttTLSClient;
+static PubSubClient     mqttClient(mqttTLSClient);
+#endif
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
@@ -822,14 +844,73 @@ void drawBootScreen(const char* wifiMsg) {
 #endif  // HAS_DISPLAY
 
 // =============================================================================
+// MQTT — Funciones auxiliares (solo ESP32 con USE_MQTT)
+// =============================================================================
+#if !defined(ESP8266) && defined(USE_MQTT)
+
+// Callback para comandos entrantes en aquantia/<finca_id>/cmd
+// Payload esperado: {"relay": 0, "state": true}
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, payload, length)) return;
+  int  relay = doc["relay"] | 0;
+  bool state = doc["state"] | false;
+  if (relay < 0 || relay >= RELAY_COUNT) return;
+  relayActive[relay] = state;
+  digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
+  Serial.printf("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+}
+
+// Conectar al broker y suscribirse al topic de comandos
+bool mqttConnect() {
+  bool ok = mqttClient.connect("aquantia-device", mqtt_user, mqtt_pass);
+  if (ok) {
+    char cmd_topic[64];
+    snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
+    mqttClient.subscribe(cmd_topic, 1);
+    Serial.printf("[MQTT] Conectado — suscrito a %s\n", cmd_topic);
+  } else {
+    Serial.printf("[MQTT] Error de conexion: rc=%d\n", mqttClient.state());
+  }
+  return ok;
+}
+
+// Publicar datos de registro al arranque (una sola vez)
+void mqttPublishRegister() {
+  StaticJsonDocument<256> doc;
+  doc["mac_address"]   = WiFi.macAddress();
+  doc["ip_address"]    = WiFi.localIP().toString();
+  doc["chip_model"]    = ESP.getChipModel();
+  doc["chip_revision"] = (int)ESP.getChipRevision();
+  doc["cpu_freq_mhz"]  = (int)ESP.getCpuFreqMHz();
+  doc["flash_size_mb"] = (int)(ESP.getFlashChipSize() / 1048576);
+  doc["sdk_version"]   = ESP.getSdkVersion();
+  doc["relay_count"]   = RELAY_COUNT;
+  char topic[64], buf[256];
+  snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
+  serializeJson(doc, buf, sizeof(buf));
+  mqttClient.publish(topic, buf, false);
+  Serial.printf("[MQTT] Register publicado: %s\n", buf);
+}
+
+#endif  // !ESP8266 && USE_MQTT
+
+// =============================================================================
 // TAREA DE RED — Core 0 (solo ESP32)
 // Gestiona OTA, relay polling y HTTP POST sin bloquear sensores/display (Core 1)
 // =============================================================================
 #ifndef ESP8266
 void networkTask(void* pvParameters) {
-  static bool   deviceInfoSent = false;
+  static bool          deviceInfoSent = false;
   static unsigned long lastRelayCheck = 0;
   static unsigned long lastSendTime   = 0;
+
+#ifdef USE_MQTT
+  mqttTLSClient.setCACert(MQTT_CA_CERT_PEM);
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512);
+#endif
 
   for (;;) {
     ArduinoOTA.handle();  // siempre primero, alta frecuencia
@@ -847,6 +928,84 @@ void networkTask(void* pvParameters) {
 
     unsigned long now = millis();
 
+#ifdef USE_MQTT
+    // ── Modo MQTT ────────────────────────────────────────────────────────────
+    if (!mqttClient.connected()) {
+      if (!mqttConnect()) {
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        continue;
+      }
+      if (!deviceInfoSent) {
+        mqttPublishRegister();
+        deviceInfoSent = true;
+      }
+    }
+    mqttClient.loop();
+
+    // Publicar telemetría cada MQTT_SEND_MS
+    if (now - lastSendTime >= MQTT_SEND_MS) {
+      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
+      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
+      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
+      long  snap_heap;
+      int   snap_rssi;
+      long  snap_uptime;
+      int   snap_relayMask = 0;
+
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        snap_tempMCP       = temperatureMCP;
+        snap_pressure      = (float)pressure;
+        snap_tempDHT       = temperatureDHT;
+        snap_humidity      = humidity;
+        snap_windSpeed     = windSpeed;
+        snap_windDir       = currentWindDirDeg;
+        snap_windSpeedFilt = windSpeedFiltered;
+        snap_avgWindDir    = calcAndResetWindVector();
+        snap_light         = lightLevel;
+        snap_tempDHT11     = temperatureDHT11;
+        snap_humDHT11      = humidityDHT11;
+        snap_soil          = soilMoisture;
+        snap_heap          = (long)ESP.getFreeHeap();
+        snap_rssi          = WiFi.RSSI();
+        snap_uptime        = (long)(millis() / 1000);
+        for (int i = 0; i < RELAY_COUNT; i++)
+          if (relayActive[i]) snap_relayMask |= (1 << i);
+        xSemaphoreGive(dataMutex);
+      }
+
+      StaticJsonDocument<384> doc;
+      doc["temperature"]           = snap_tempMCP;
+      doc["pressure"]              = snap_pressure;
+      doc["temperature_barometer"] = snap_tempDHT;
+      doc["humidity"]              = snap_humidity;
+      doc["windSpeed"]             = snap_windSpeed;
+      doc["windDirection"]         = snap_windDir;
+      doc["windSpeedFiltered"]     = snap_windSpeedFilt;
+      doc["windDirectionFiltered"] = snap_avgWindDir;
+      doc["light"]                 = snap_light;
+      doc["dht_temperature"]       = snap_tempDHT11;
+      doc["dht_humidity"]          = snap_humDHT11;
+      doc["rssi"]                  = snap_rssi;
+      doc["free_heap"]             = snap_heap;
+      doc["uptime_s"]              = snap_uptime;
+      doc["relay_active"]          = snap_relayMask;
+      doc["soil_moisture"]         = snap_soil;
+      doc["mac_address"]           = WiFi.macAddress();
+
+      char topic[64], buf[384];
+      snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
+      serializeJson(doc, buf, sizeof(buf));
+      digitalWrite(ledPin, LED_ON);
+      bool ok = mqttClient.publish(topic, buf, false);
+      digitalWrite(ledPin, LED_OFF);
+      Serial.printf("[MQTT] TX %s: %s\n", ok ? "OK" : "ERROR", buf);
+
+      lastServerOK = ok;
+      lastSendTime = now;
+    }
+
+#else
+    // ── Modo HTTP legacy ──────────────────────────────────────────────────────
     // Device info — una sola vez tras conectar
     if (!deviceInfoSent) {
       postDeviceInfo();
@@ -859,9 +1018,8 @@ void networkTask(void* pvParameters) {
       lastRelayCheck = now;
     }
 
-    // HTTP POST cada 20s — captura snapshot con mutex
+    // HTTP POST cada SEND_MS — captura snapshot con mutex
     if (now - lastSendTime >= SEND_MS) {
-      // Snapshot de valores sensor bajo mutex (lectura atómica)
       float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
       float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
       float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
@@ -910,6 +1068,7 @@ void networkTask(void* pvParameters) {
       lastServerOK = ok;
       lastSendTime = now;
     }
+#endif  // USE_MQTT
 
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
@@ -1112,13 +1271,34 @@ void setup() {
     });
     ArduinoOTA.begin();
 
+#if !defined(ESP8266) && defined(USE_MQTT)
+    // Sincronizar reloj via NTP — necesario para validar cert TLS de MQTT
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    Serial.print("[NTP] Sincronizando hora");
+    {
+      time_t now = time(nullptr);
+      int ntpTries = 0;
+      while (now < 1000000000L && ntpTries < 20) {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+        ntpTries++;
+      }
+      Serial.printf("\n[NTP] Hora: %s", ctime(&now));
+    }
+#endif
+
 #ifndef ESP8266
     // FreeRTOS: crear tarea de red en Core 0
     dataMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(
       networkTask,        // función
       "NetworkTask",      // nombre
-      8192,               // stack (bytes)
+#ifdef USE_MQTT
+      12288,              // stack ampliado para TLS (WiFiClientSecure + PubSubClient)
+#else
+      8192,               // stack estándar para HTTP legacy
+#endif
       nullptr,            // parámetros
       2,                  // prioridad (más alta que loop=1)
       &networkTaskHandle, // handle
