@@ -174,11 +174,11 @@ static const char _PROV_SAVED_HTML[] PROGMEM = R"rawliteral(
  * Esta función NO retorna bajo operación normal.
  */
 void provisioning_start_ap() {
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  String macStr = WiFi.macAddress();  // "AA:BB:CC:DD:EE:FF"
   char ap_ssid[32];
-  snprintf(ap_ssid, sizeof(ap_ssid), "Aquantia-%02X%02X%02X",
-           mac[3], mac[4], mac[5]);
+  snprintf(ap_ssid, sizeof(ap_ssid), "Aquantia-%c%c%c%c%c%c",
+           macStr[12], macStr[13], macStr[15], macStr[16],
+           macStr[18], macStr[19]);
 
   Serial.printf("[PROV] Sin credenciales — AP: %s\n", ap_ssid);
 
