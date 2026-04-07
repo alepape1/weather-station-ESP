@@ -906,7 +906,7 @@ void networkTask(void* pvParameters) {
   static unsigned long lastSendTime   = 0;
 
 #ifdef USE_MQTT
-  mqttTLSClient.setCACert(MQTT_CA_CERT_PEM);
+  mqttTLSClient.setInsecure();  // DEBUG: skip cert verify — revert to setCACert() cuando funcione
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);
