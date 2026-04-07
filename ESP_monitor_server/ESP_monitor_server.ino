@@ -62,6 +62,11 @@
   #include <time.h>
 #endif
 
+// Provisioning: SoftAP captive portal + NVS (solo ESP32)
+#ifndef ESP8266
+  #include "provisioning.h"
+#endif
+
 // ── Perfiles de dispositivo (definir DEVICE_PROFILE en secrets.h) ─────────────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
@@ -1084,6 +1089,35 @@ void setup() {
   setCpuFrequencyMhz(160);
   Serial.println("\n\n=== MeteoStation BOOT ===");
 
+  // ── Provisioning (solo ESP32): factory reset + carga NVS ──────────────────
+#ifndef ESP8266
+  provisioning_check_factory_reset();
+
+  // Fallback: copiar credenciales de secrets.h antes de intentar NVS
+  strlcpy(prov_ssid,       WIFI_SSID,     sizeof(prov_ssid));
+  strlcpy(prov_password,   WIFI_PASSWORD, sizeof(prov_password));
+#ifdef USE_MQTT
+  strlcpy(prov_finca_id,   FINCA_ID,      sizeof(prov_finca_id));
+  strlcpy(prov_mqtt_token, MQTT_PASS,     sizeof(prov_mqtt_token));
+#endif
+
+  provisioning_load();  // sobreescribe con NVS si existen valores guardados
+
+  if (!provisioning_has_credentials()) {
+    // Sin credenciales en NVS ni en secrets.h → portal SoftAP (no retorna)
+    provisioning_start_ap();
+  }
+
+  // Reasignar punteros de credenciales a los buffers NVS
+  ssid     = prov_ssid;
+  password = prov_password;
+#ifdef USE_MQTT
+  finca_id  = prov_finca_id;
+  mqtt_pass = prov_mqtt_token;
+#endif
+  Serial.printf("[PROV] WiFi: %s  |  Finca: %s\n", prov_ssid, prov_finca_id);
+#endif  // !ESP8266
+
   Serial.println("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.println("I2C OK");
@@ -1233,6 +1267,15 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi OK: " + WiFi.localIP().toString());
+
+#if !defined(ESP8266) && defined(USE_MQTT)
+    // mqtt_user = MAC del dispositivo (usado por mosquitto-go-auth para lookup)
+    static char _mac_buf[20];
+    strncpy(_mac_buf, WiFi.macAddress().c_str(), sizeof(_mac_buf) - 1);
+    _mac_buf[sizeof(_mac_buf) - 1] = '\0';
+    mqtt_user = _mac_buf;
+    Serial.printf("[MQTT] Auth user (MAC): %s\n", mqtt_user);
+#endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────
 #ifdef ESP8266
