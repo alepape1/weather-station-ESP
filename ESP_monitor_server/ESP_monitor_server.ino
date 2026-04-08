@@ -1365,6 +1365,14 @@ void setup() {
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
+#ifndef ESP8266
+    // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
+    // para que el usuario corrija la red (p.ej. contraseña cambiada).
+    if (prov_ssid[0] != '\0') {
+      Serial.println("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
+      provisioning_start_ap();  // no retorna
+    }
+#endif
     Serial.println("Sin WiFi — continuando sin conexion (OTA no disponible)");
 #ifdef HAS_DISPLAY
     drawBootScreen("Sin WiFi — modo offline");

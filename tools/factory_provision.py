@@ -125,6 +125,7 @@ def flash_nvs(port: str, mac: str, serial_number: str, token: str,
 
 
 def main():
+    global BACKEND_URL
     parser = argparse.ArgumentParser(description="Aprovisionamiento de fábrica Aquantia")
     parser.add_argument("--mac", required=True,
                         help="MAC del ESP32 (ej: AA:BB:CC:DD:EE:FF)")
@@ -138,7 +139,6 @@ def main():
                         help=f"URL del backend (defecto: {BACKEND_URL})")
     args = parser.parse_args()
 
-    global BACKEND_URL
     BACKEND_URL = args.backend_url.rstrip("/")
 
     mac = args.mac.upper().replace("-", ":")

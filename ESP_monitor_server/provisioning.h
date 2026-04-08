@@ -247,7 +247,10 @@ void provisioning_start_ap() {
            macStr[12], macStr[13], macStr[15], macStr[16],
            macStr[18], macStr[19]);
 
-  Serial.printf("[PROV] Sin credenciales — AP: %s\n", ap_ssid);
+  bool reconfigure = (prov_ssid[0] != '\0');
+  Serial.printf("[PROV] %s — AP: %s\n",
+                reconfigure ? "Reconectando (WiFi fallido)" : "Sin credenciales",
+                ap_ssid);
 
   // WIFI_AP_STA permite escanear redes mientras el AP está activo
   WiFi.mode(WIFI_AP_STA);
