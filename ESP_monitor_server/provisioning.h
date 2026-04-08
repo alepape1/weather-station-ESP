@@ -254,7 +254,7 @@ void provisioning_start_ap() {
 
   // WIFI_AP_STA permite escanear redes mientras el AP está activo
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(ap_ssid);
+  WiFi.softAP(ap_ssid, "aquantia1");
   delay(500);
 
   IPAddress apIP(192, 168, 4, 1);
