@@ -91,26 +91,43 @@ static const char _PROV_HTML[] PROGMEM = R"rawliteral(
 <style>
   *{box-sizing:border-box}
   body{font-family:system-ui,sans-serif;background:#f0f4f8;margin:0;
-       padding:20px;color:#1a2a3a;min-height:100vh}
-  .card{background:#fff;border-radius:16px;padding:24px;max-width:400px;
-        margin:20px auto;box-shadow:0 2px 16px #0001}
-  .logo{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+       padding:16px;color:#1a2a3a;min-height:100vh}
+  .card{background:#fff;border-radius:16px;padding:20px;max-width:420px;
+        margin:0 auto;box-shadow:0 2px 16px #0001}
+  .logo{display:flex;align-items:center;gap:10px;margin-bottom:18px}
   .drop{width:36px;height:36px;background:#e8f5fd;border-radius:10px;
-        display:flex;align-items:center;justify-content:center;font-size:20px}
-  h2{margin:0;font-size:1.15rem;color:#0c8ecc}
-  p.sub{margin:2px 0 0;font-size:.8rem;color:#888}
-  label{display:block;font-size:.75rem;font-weight:700;color:#666;
+        display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+  h2{margin:0;font-size:1.1rem;color:#0c8ecc}
+  p.sub{margin:2px 0 0;font-size:.78rem;color:#888}
+  label{display:block;font-size:.72rem;font-weight:700;color:#666;
         text-transform:uppercase;letter-spacing:.06em;margin:14px 0 4px}
   input{width:100%;border:1.5px solid #dde3ea;border-radius:10px;
-        padding:10px 13px;font-size:.95rem;outline:none;color:#1a2a3a}
+        padding:10px 13px;font-size:.95rem;outline:none;color:#1a2a3a;background:#fff}
   input:focus{border-color:#0c8ecc;box-shadow:0 0 0 3px #0c8ecc22}
-  .hint{font-size:.75rem;color:#aaa;margin:3px 0 0}
-  button{margin-top:20px;width:100%;background:#0c8ecc;color:#fff;border:none;
+  .hint{font-size:.72rem;color:#aaa;margin:3px 0 0}
+  .save-btn{margin-top:20px;width:100%;background:#0c8ecc;color:#fff;border:none;
          border-radius:10px;padding:13px;font-size:1rem;font-weight:700;
-         cursor:pointer;letter-spacing:.01em}
-  button:active{background:#0a7ab0}
-  .sep{border:none;border-top:1px solid #eee;margin:18px 0}
-  .mac{font-size:.75rem;color:#bbb;text-align:center}
+         cursor:pointer}
+  .save-btn:active{background:#0a7ab0}
+  .sep{border:none;border-top:1px solid #eee;margin:16px 0}
+
+  /* ── WiFi list ── */
+  #wifi-list{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+  .net{display:flex;align-items:center;gap:10px;padding:9px 12px;
+       border:1.5px solid #dde3ea;border-radius:10px;cursor:pointer;
+       background:#fff;transition:border-color .15s,background .15s}
+  .net:hover{border-color:#0c8ecc;background:#f0f8fd}
+  .net.selected{border-color:#0c8ecc;background:#e8f5fd}
+  .net-name{flex:1;font-size:.9rem;font-weight:600;color:#1a2a3a;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .net-lock{font-size:.75rem;color:#aaa}
+  .bars{display:flex;align-items:flex-end;gap:2px;height:16px}
+  .bars span{width:4px;background:#dde3ea;border-radius:2px}
+  .bars span.on{background:#0c8ecc}
+  .scan-btn{width:100%;padding:9px;border:1.5px dashed #dde3ea;border-radius:10px;
+            background:#fff;color:#888;font-size:.85rem;cursor:pointer;margin-top:4px}
+  .scan-btn:hover{border-color:#0c8ecc;color:#0c8ecc}
+  .scanning{color:#0c8ecc;font-size:.82rem;text-align:center;padding:8px}
 </style>
 </head>
 <body>
@@ -119,22 +136,72 @@ static const char _PROV_HTML[] PROGMEM = R"rawliteral(
     <div class="drop">&#128167;</div>
     <div><h2>Aquantia</h2><p class="sub">Configuraci&oacute;n del dispositivo</p></div>
   </div>
+
   <form method="POST" action="/save">
-    <label>Red WiFi (SSID)</label>
-    <input name="ssid" type="text" required autocomplete="off" placeholder="NombreDeRedWiFi">
+    <label>Red WiFi</label>
+    <div id="wifi-list"><p class="scanning">Buscando redes...</p></div>
+    <button type="button" class="scan-btn" id="scan-btn" onclick="scan()">&#8635; Buscar de nuevo</button>
+
+    <label>SSID seleccionado</label>
+    <input id="ssid-input" name="ssid" type="text" required autocomplete="off" placeholder="O escribe el nombre manualmente">
+
     <label>Contrase&ntilde;a WiFi</label>
-    <input name="password" type="password" autocomplete="off" placeholder="(vac&iacute;o si la red es abierta)">
+    <input name="password" type="password" id="pass-input" autocomplete="off" placeholder="(vac&iacute;o si la red es abierta)">
+
+    <hr class="sep">
+
     <label>Finca ID</label>
     <input name="finca_id" type="text" required autocomplete="off" placeholder="mi-finca">
     <p class="hint">Identificador &uacute;nico de tu instalaci&oacute;n (letras, n&uacute;meros y guiones).</p>
+
     <label>Token del dispositivo</label>
-    <input name="mqtt_token" type="text" required autocomplete="off" placeholder="Copia el token de la etiqueta">
+    <input name="mqtt_token" type="text" required autocomplete="off" placeholder="Token de la etiqueta">
     <p class="hint">Impreso en la etiqueta del dispositivo. No lo compartas.</p>
-    <button type="submit">Guardar y conectar &rarr;</button>
+
+    <button type="submit" class="save-btn">Guardar y conectar &rarr;</button>
   </form>
-  <hr class="sep">
-  <p class="mac" id="mac"></p>
 </div>
+
+<script>
+function bars(rssi) {
+  var lvl = rssi > -55 ? 4 : rssi > -67 ? 3 : rssi > -78 ? 2 : 1;
+  var h = ['4px','7px','11px','15px'];
+  var s = '';
+  for (var i = 0; i < 4; i++)
+    s += '<span style="height:'+h[i]+'"class="'+(i<lvl?'on':'')+'"></span>';
+  return '<div class="bars">'+s+'</div>';
+}
+
+function select(ssid, open) {
+  document.getElementById('ssid-input').value = ssid;
+  if (open) document.getElementById('pass-input').value = '';
+  document.querySelectorAll('.net').forEach(function(n){n.classList.remove('selected')});
+  var clicked = event.currentTarget;
+  if (clicked) clicked.classList.add('selected');
+}
+
+function scan() {
+  var list = document.getElementById('wifi-list');
+  list.innerHTML = '<p class="scanning">&#8635; Buscando redes...</p>';
+  document.getElementById('scan-btn').disabled = true;
+  fetch('/scan').then(function(r){return r.json()}).then(function(nets){
+    document.getElementById('scan-btn').disabled = false;
+    if (!nets.length){list.innerHTML='<p class="scanning">No se encontraron redes.</p>';return;}
+    list.innerHTML = nets.map(function(n){
+      return '<div class="net" onclick="select(\''+n.ssid.replace(/'/g,"\\'")+'\',' +n.open+')">'
+        + bars(n.rssi)
+        + '<span class="net-name">'+n.ssid+'</span>'
+        + '<span class="net-lock">'+(n.open?'':'&#128274;')+'</span>'
+        + '</div>';
+    }).join('');
+  }).catch(function(){
+    document.getElementById('scan-btn').disabled = false;
+    list.innerHTML='<p class="scanning">Error al escanear. Escribe el SSID manualmente.</p>';
+  });
+}
+
+scan();
+</script>
 </body>
 </html>
 )rawliteral";
@@ -182,7 +249,8 @@ void provisioning_start_ap() {
 
   Serial.printf("[PROV] Sin credenciales — AP: %s\n", ap_ssid);
 
-  WiFi.mode(WIFI_AP);
+  // WIFI_AP_STA permite escanear redes mientras el AP está activo
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ap_ssid);
   delay(500);
 
@@ -195,6 +263,27 @@ void provisioning_start_ap() {
 
   server.on("/", HTTP_GET, [&server]() {
     server.send_P(200, "text/html; charset=utf-8", _PROV_HTML);
+  });
+
+  // Escaneo WiFi — devuelve JSON con redes ordenadas por RSSI
+  server.on("/scan", HTTP_GET, [&server]() {
+    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i).isEmpty()) continue;
+      if (i > 0 && json.length() > 1) json += ",";
+      // Escapar comillas en el SSID
+      String ssid = WiFi.SSID(i);
+      ssid.replace("\\", "\\\\");
+      ssid.replace("\"", "\\\"");
+      json += "{\"ssid\":\"" + ssid + "\","
+              "\"rssi\":"   + WiFi.RSSI(i) + ","
+              "\"open\":"   + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    server.send(200, "application/json", json);
+    Serial.printf("[PROV] Scan: %d redes encontradas\n", n);
   });
 
   server.on("/save", HTTP_POST, [&server]() {
