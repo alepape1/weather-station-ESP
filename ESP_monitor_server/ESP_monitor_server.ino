@@ -49,6 +49,10 @@
 
 #include <SPI.h>
 #include <Wire.h>
+// ESP32 Arduino core 3.x eliminó BitOrder — shim para Adafruit_BusIO
+#if defined(ARDUINO_ARCH_ESP32) && !defined(BitOrder)
+typedef uint8_t BitOrder;
+#endif
 #include <Adafruit_MCP9808.h>
 #include <SparkFun_MicroPressure.h>
 #include <DHTesp.h>
