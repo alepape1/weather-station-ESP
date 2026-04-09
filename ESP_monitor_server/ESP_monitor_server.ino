@@ -34,7 +34,9 @@
     #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
     #define SOIL_RAW_WET   1000   // ADC en tierra saturada (~100%) — ajustar con valor raw del serial
   #endif
-  #define HAS_DISPLAY
+  #if DEVICE_PROFILE == PROFILE_METEO
+    #define HAS_DISPLAY
+  #endif
   #define RELAY_PIN        26   // GPIO libre para relay electroválvula
 #endif
 

@@ -184,7 +184,14 @@ function scan() {
   var list = document.getElementById('wifi-list');
   list.innerHTML = '<p class="scanning">&#8635; Buscando redes...</p>';
   document.getElementById('scan-btn').disabled = true;
-  fetch('/scan').then(function(r){return r.json()}).then(function(nets){
+  fetch('/scan').then(function(r){
+    if(r.status===202){
+      setTimeout(scan,2000);  // todavía escaneando, reintentar en 2s
+      return null;
+    }
+    return r.json();
+  }).then(function(nets){
+    if(!nets) return;
     document.getElementById('scan-btn').disabled = false;
     if (!nets.length){list.innerHTML='<p class="scanning">No se encontraron redes.</p>';return;}
     list.innerHTML = nets.map(function(n){
@@ -268,14 +275,27 @@ void provisioning_start_ap() {
     server.send_P(200, "text/html; charset=utf-8", _PROV_HTML);
   });
 
-  // Escaneo WiFi — devuelve JSON con redes ordenadas por RSSI
+  // Lanzar scan asíncrono al arrancar el portal (no bloquea)
+  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+
+  // Escaneo WiFi — devuelve JSON cuando el scan asíncrono ha terminado
   server.on("/scan", HTTP_GET, [&server]() {
-    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) {
+      // Todavía escaneando — el cliente reintentará
+      server.send(202, "application/json", "[]");
+      return;
+    }
+    if (n < 0) {
+      // Error o no iniciado — lanzar nuevo scan asíncrono y devolver vacío
+      WiFi.scanNetworks(/*async=*/true);
+      server.send(200, "application/json", "[]");
+      return;
+    }
     String json = "[";
     for (int i = 0; i < n; i++) {
       if (WiFi.SSID(i).isEmpty()) continue;
-      if (i > 0 && json.length() > 1) json += ",";
-      // Escapar comillas en el SSID
+      if (json.length() > 1) json += ",";
       String ssid = WiFi.SSID(i);
       ssid.replace("\\", "\\\\");
       ssid.replace("\"", "\\\"");
@@ -285,8 +305,10 @@ void provisioning_start_ap() {
     }
     json += "]";
     WiFi.scanDelete();
+    // Lanzar siguiente scan asíncrono para mantener la lista actualizada
+    WiFi.scanNetworks(/*async=*/true);
     server.send(200, "application/json", json);
-    Serial.printf("[PROV] Scan: %d redes encontradas\n", n);
+    Serial.printf("[PROV] Scan: %d redes\n", n);
   });
 
   server.on("/save", HTTP_POST, [&server]() {
@@ -321,7 +343,8 @@ void provisioning_start_ap() {
   for (;;) {
     dns.processNextRequest();
     server.handleClient();
-    delay(5);
+    delay(10);
+    yield();
   }
 }
 
