@@ -304,15 +304,34 @@ class FlasherApp(tk.Tk):
         # ── Botones ──
         btn_frame = tk.Frame(self)
         btn_frame.grid(row=6, column=0, columnspan=2, pady=8)
+        # ── Modo DEV / PROD ──
+        self._dev_mode_var = tk.BooleanVar(value=self._read_dev_mode())
+        mode_frame = tk.Frame(btn_frame)
+        mode_frame.grid(row=0, column=0, columnspan=3, pady=(0, 6))
+        tk.Label(mode_frame, text="Modo:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._btn_dev  = tk.Button(mode_frame, text="🛠 DEV",  width=10,
+                                   relief="sunken", bg="#2d6a9f", fg="white",
+                                   font=("Segoe UI", 9, "bold"),
+                                   command=self._set_dev_mode)
+        self._btn_dev.pack(side="left", padx=2)
+        self._btn_prod = tk.Button(mode_frame, text="🏭 PROD", width=10,
+                                   relief="raised", bg="#e0e0e0",
+                                   font=("Segoe UI", 9),
+                                   command=self._set_prod_mode)
+        self._btn_prod.pack(side="left", padx=2)
+        self._mode_lbl = tk.Label(mode_frame, font=("Segoe UI", 8, "italic"), fg="#888")
+        self._mode_lbl.pack(side="left", padx=8)
+        self._update_mode_ui()
+
         self._btn_compile = ttk.Button(btn_frame, text="⚙  Compilar",
                                        width=16, command=self._compile)
-        self._btn_compile.grid(row=0, column=0, padx=6)
+        self._btn_compile.grid(row=1, column=0, padx=6)
         self._btn_serial  = ttk.Button(btn_frame, text="🔌  Flash USB",
                                        width=16, command=self._flash_serial)
-        self._btn_serial.grid(row=0, column=1, padx=6)
+        self._btn_serial.grid(row=1, column=1, padx=6)
         self._btn_ota     = ttk.Button(btn_frame, text="📡  Flash OTA",
                                        width=16, command=self._flash_ota)
-        self._btn_ota.grid(row=0, column=2, padx=6)
+        self._btn_ota.grid(row=1, column=2, padx=6)
 
         # ── Estado ──
         self._status_var = tk.StringVar(value="Listo")
@@ -429,6 +448,64 @@ class FlasherApp(tk.Tk):
         except FileNotFoundError as e:
             self._log_line(f"ERROR: {e}", "#f44747")
             return False, -1
+
+    # ── DEV / PROD mode ───────────────────────────────────────────────────────
+
+    _SECRETS_PATH = os.path.join(SKETCH_DIR, "secrets.h")
+
+    def _read_dev_mode(self):
+        """Lee si #define DEV_MODE está activo en secrets.h."""
+        try:
+            with open(self._SECRETS_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s == "#define DEV_MODE":
+                        return True
+                    if s == "// #define DEV_MODE":
+                        return False
+        except Exception:
+            pass
+        return True  # por defecto dev
+
+    def _write_dev_mode(self, dev):
+        """Activa o desactiva #define DEV_MODE en secrets.h."""
+        try:
+            with open(self._SECRETS_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(self._SECRETS_PATH, "w", encoding="utf-8") as f:
+                for line in lines:
+                    s = line.strip()
+                    if s in ("#define DEV_MODE", "// #define DEV_MODE"):
+                        f.write(("#define DEV_MODE\n") if dev else ("// #define DEV_MODE\n"))
+                    else:
+                        f.write(line)
+            return True
+        except Exception as e:
+            self._log_line(f"Error escribiendo secrets.h: {e}", "#f44747")
+            return False
+
+    def _set_dev_mode(self):
+        if self._write_dev_mode(True):
+            self._dev_mode_var.set(True)
+            self._update_mode_ui()
+            self._refresh_binary_status()
+
+    def _set_prod_mode(self):
+        if self._write_dev_mode(False):
+            self._dev_mode_var.set(False)
+            self._update_mode_ui()
+            self._refresh_binary_status()
+
+    def _update_mode_ui(self):
+        dev = self._dev_mode_var.get()
+        if dev:
+            self._btn_dev.config(relief="sunken",  bg="#2d6a9f", fg="white")
+            self._btn_prod.config(relief="raised", bg="#e0e0e0", fg="black")
+            self._mode_lbl.config(text="Arranca directo con secrets.h", fg="#4ec9b0")
+        else:
+            self._btn_dev.config(relief="raised",  bg="#e0e0e0", fg="black")
+            self._btn_prod.config(relief="sunken", bg="#8b4513", fg="white")
+            self._mode_lbl.config(text="Portal SoftAP + NVS + token de fábrica", fg="#f0a000")
 
     # ── Lógica principal ──────────────────────────────────────────────────────
 

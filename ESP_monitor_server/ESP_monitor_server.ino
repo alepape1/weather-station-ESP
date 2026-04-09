@@ -47,15 +47,21 @@
 #define PIPELINE_NOISE_Q    0.12f  // L/min — dispersión caudalímetro
 #define PIPELINE_NOMINAL_Q  5.00f  // L/min — caudal nominal del sistema
 
-#include <SPI.h>
-#include <Wire.h>
-// ESP32 Arduino core 3.x eliminó BitOrder — shim para Adafruit_BusIO
-#if defined(ARDUINO_ARCH_ESP32) && !defined(BitOrder)
-typedef uint8_t BitOrder;
+// Librerías de sensores meteorológicos — solo perfil METEO
+#if DEVICE_PROFILE == PROFILE_METEO
+  #include <SPI.h>
+  #include <Wire.h>
+  // ESP32 Arduino core 3.x eliminó BitOrder — shim para Adafruit_BusIO
+  #if defined(ARDUINO_ARCH_ESP32) && !defined(BitOrder)
+    typedef uint8_t BitOrder;
+  #endif
+  #include <Adafruit_MCP9808.h>
+  #include <SparkFun_MicroPressure.h>
+  #include <DHTesp.h>
+#else
+  // IRRIGATION: solo I2C básico (sin sensores meteo)
+  #include <Wire.h>
 #endif
-#include <Adafruit_MCP9808.h>
-#include <SparkFun_MicroPressure.h>
-#include <DHTesp.h>
 #include <ArduinoJson.h>
 #include <math.h>
 #include "secrets.h"
@@ -134,9 +140,11 @@ const int ledPin = 2;
 #endif
 
 // ── Objetos ────────────────────────────────────────────────────────────────────
-SparkFun_MicroPressure barometer;
-Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
-DHTesp                 dht;
+#if DEVICE_PROFILE == PROFILE_METEO
+  SparkFun_MicroPressure barometer;
+  Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
+  DHTesp                 dht;
+#endif
 
 #ifdef HAS_DISPLAY
   TFT_eSPI    tft = TFT_eSPI();
@@ -159,7 +167,9 @@ static PubSubClient     mqttClient(mqttTLSClient);
 bool mcp_ok = false;
 bool bar_ok = false;
 bool htu_ok = false;
+#if DEVICE_PROFILE == PROFILE_METEO
 bool dht_ok = false;
+#endif
 bool tsl_ok = false;
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
@@ -1095,11 +1105,16 @@ void setup() {
   setCpuFrequencyMhz(160);
   Serial.println("\n\n=== MeteoStation BOOT ===");
 
-  // ── Provisioning (solo ESP32): factory reset + carga NVS ──────────────────
-#ifndef ESP8266
+  // ── Credenciales: DEV_MODE (directo) vs PROD (NVS + portal) ──────────────
+#ifdef DEV_MODE
+  // ── Modo desarrollo: usa secrets.h directamente, sin NVS ni portal ────────
+  Serial.println("[DEV] DEV_MODE activo — saltando provisioning");
+  // ssid/password/finca_id/mqtt_pass ya apuntan a los literales de secrets.h
+#elif !defined(ESP8266)
+  // ── Modo producción: factory reset + NVS + portal SoftAP ─────────────────
   provisioning_check_factory_reset();
 
-  // Fallback: copiar credenciales de secrets.h antes de intentar NVS
+  // Precargar valores de secrets.h como fallback antes de leer NVS
   strlcpy(prov_ssid,       WIFI_SSID,     sizeof(prov_ssid));
   strlcpy(prov_password,   WIFI_PASSWORD, sizeof(prov_password));
 #ifdef USE_MQTT
@@ -1110,11 +1125,9 @@ void setup() {
   provisioning_load();  // sobreescribe con NVS si existen valores guardados
 
   if (!provisioning_has_credentials()) {
-    // Sin credenciales en NVS ni en secrets.h → portal SoftAP (no retorna)
-    provisioning_start_ap();
+    provisioning_start_ap();  // bloquea hasta que el usuario configure
   }
 
-  // Reasignar punteros de credenciales a los buffers NVS
   ssid     = prov_ssid;
   password = prov_password;
 #ifdef USE_MQTT
@@ -1122,7 +1135,7 @@ void setup() {
   mqtt_pass = prov_mqtt_token;
 #endif
   Serial.printf("[PROV] WiFi: %s  |  Finca: %s\n", prov_ssid, prov_finca_id);
-#endif  // !ESP8266
+#endif  // DEV_MODE / producción
 
   Serial.println("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1172,6 +1185,7 @@ void setup() {
   lastActivityTime = millis();
 #endif
 
+#if DEVICE_PROFILE == PROFILE_METEO
   mcp_ok = tempsensor.begin(0x19);
   if (mcp_ok) {
     tempsensor.setResolution(3);
@@ -1188,6 +1202,10 @@ void setup() {
     Serial.println("Barometro no detectado — modo simulacion");
     pressure = sim_pressure;
   }
+#else
+  Serial.println("MCP9808 — perfil IRRIGATION, sensor omitido");
+  Serial.println("Barometro — perfil IRRIGATION, sensor omitido");
+#endif
 
   htu_ok = htu_begin();
   if (htu_ok) {
@@ -1208,6 +1226,7 @@ void setup() {
     humidity       = sim_humidity;
   }
 
+#if DEVICE_PROFILE == PROFILE_METEO
   // DHT11
   dht.setup(DHTPIN, DHTesp::DHT11);
   delay(dht.getMinimumSamplingPeriod());
@@ -1224,6 +1243,9 @@ void setup() {
       humidityDHT11    = sim_humDHT11;
     }
   }
+#else
+  Serial.println("DHT11 — perfil IRRIGATION, sensor omitido");
+#endif
 
   // TSL2584 — el begin() ya espera la primera integración (450ms)
   tsl_ok = tsl_begin();
@@ -1444,6 +1466,7 @@ void loop() {
     bool hasMutex = (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE);
 #endif
 
+#if DEVICE_PROFILE == PROFILE_METEO
     // MCP9808
     if (mcp_ok) {
       tempsensor.wake();
@@ -1469,6 +1492,7 @@ void loop() {
       }
     }
     if (!bar_ok) pressure = sim_pressure;
+#endif
 
     // HTU2x
     if (htu_ok) {
@@ -1487,6 +1511,7 @@ void loop() {
       humidity       = sim_humidity;
     }
 
+#if DEVICE_PROFILE == PROFILE_METEO
     // DHT11
     {
       TempAndHumidity th = dht.getTempAndHumidity();
@@ -1502,6 +1527,7 @@ void loop() {
       temperatureDHT11 = sim_tempDHT11;
       humidityDHT11    = sim_humDHT11;
     }
+#endif
 
     // TSL2584
     if (tsl_ok) {
