@@ -3,7 +3,7 @@
 factory_provision.py — Script de aprovisionamiento de fábrica para dispositivos Aquantia.
 
 Uso:
-    python factory_provision.py --mac AA:BB:CC:DD:EE:FF --serial AQ-0001
+    python factory_provision.py --mac AA:BB:CC:DD:EE:FF --serial AQ-FCB467F37748
 
 Genera un token aleatorio, lo hashea con bcrypt y lo registra en el backend via
 POST /api/devices/register_factory (solo aceptado desde localhost).
@@ -129,8 +129,8 @@ def main():
     parser = argparse.ArgumentParser(description="Aprovisionamiento de fábrica Aquantia")
     parser.add_argument("--mac", required=True,
                         help="MAC del ESP32 (ej: AA:BB:CC:DD:EE:FF)")
-    parser.add_argument("--serial", required=True,
-                        help="Número de serie del dispositivo (ej: AQ-0001)")
+    parser.add_argument("--serial", required=False,
+                        help="Número de serie del dispositivo (ej: AQ-FCB467F37748)")
     parser.add_argument("--finca-id", default="",
                         help="finca_id a asignar (opcional, normalmente lo elige el usuario)")
     parser.add_argument("--port", default="",
@@ -142,7 +142,10 @@ def main():
     BACKEND_URL = args.backend_url.rstrip("/")
 
     mac = args.mac.upper().replace("-", ":")
-    serial_number = args.serial.upper()
+    if args.serial:
+        serial_number = args.serial.upper()
+    else:
+        serial_number = f"AQ-{mac.replace(":", "")}"
 
     print(f"Aprovisionando dispositivo: MAC={mac}  SN={serial_number}")
 

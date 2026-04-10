@@ -18,6 +18,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 // ── Buffers globales de credenciales ─────────────────────────────────────────
 char prov_ssid[64]       = "";
@@ -27,17 +28,20 @@ char prov_mqtt_token[72] = "";  // token pre-flasheado en fábrica por Flash Too
 #define FACTORY_RESET_PIN 0   // GPIO0 — botón BOOT en casi todos los ESP32
 
 // ── Serial del dispositivo ────────────────────────────────────────────────────
-// Formato: AQ-{MAC 12 hex}-{FlashChipID 8 hex}  ej: AQ-FCB467F37748-001640EF
-// Vinculado al hardware: MAC grabada en eFuse + ID del chip flash.
+// Formato: AQ-{MAC 12 hex}  ej: AQ-FCB467F37748
+// Vinculado al hardware: MAC grabada en eFuse.
 // Se usa como identidad del dispositivo en el QR de la etiqueta y en MQTT.
 
 static char _device_serial[48] = "";
 
 const char* device_serial_get() {
   if (_device_serial[0] != '\0') return _device_serial;
-  String mac = WiFi.macAddress();  // "FC:B4:67:F3:77:48"
-  mac.replace(":", "");            // "FCB467F37748"
-  snprintf(_device_serial, sizeof(_device_serial), "AQ-%s", mac.c_str());
+  // esp_read_mac lee directo de eFuse — no requiere WiFi inicializado
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(_device_serial, sizeof(_device_serial),
+           "AQ-%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return _device_serial;
 }
 
