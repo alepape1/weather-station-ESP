@@ -995,7 +995,7 @@ void networkTask(void* pvParameters) {
         xSemaphoreGive(dataMutex);
       }
 
-      StaticJsonDocument<384> doc;
+      StaticJsonDocument<512> doc;
       doc["temperature"]           = snap_tempMCP;
       doc["pressure"]              = snap_pressure;
       doc["temperature_barometer"] = snap_tempDHT;
@@ -1013,8 +1013,14 @@ void networkTask(void* pvParameters) {
       doc["relay_active"]          = snap_relayMask;
       doc["soil_moisture"]         = snap_soil;
       doc["mac_address"]           = WiFi.macAddress();
+      // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
+      // El backend lo usa como timestamp real de la medición en lugar de NOW().
+      {
+        time_t ntp_ts = time(nullptr);
+        if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
+      }
 
-      char topic[64], buf[384];
+      char topic[64], buf[512];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       serializeJson(doc, buf, sizeof(buf));
       digitalWrite(ledPin, LED_ON);
