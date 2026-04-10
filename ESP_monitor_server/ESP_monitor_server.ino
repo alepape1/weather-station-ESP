@@ -898,7 +898,8 @@ bool mqttConnect() {
 
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
+  doc["device_serial"] = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
   doc["mac_address"]   = WiFi.macAddress();
   doc["ip_address"]    = WiFi.localIP().toString();
   doc["chip_model"]    = ESP.getChipModel();
@@ -1114,15 +1115,7 @@ void setup() {
   // ── Modo producción: factory reset + NVS + portal SoftAP ─────────────────
   provisioning_check_factory_reset();
 
-  // Precargar valores de secrets.h como fallback antes de leer NVS
-  strlcpy(prov_ssid,       WIFI_SSID,     sizeof(prov_ssid));
-  strlcpy(prov_password,   WIFI_PASSWORD, sizeof(prov_password));
-#ifdef USE_MQTT
-  strlcpy(prov_finca_id,   FINCA_ID,      sizeof(prov_finca_id));
-  strlcpy(prov_mqtt_token, MQTT_PASS,     sizeof(prov_mqtt_token));
-#endif
-
-  provisioning_load();  // sobreescribe con NVS si existen valores guardados
+  provisioning_load();  // carga ssid+password desde NVS si existen
 
   if (!provisioning_has_credentials()) {
     provisioning_start_ap();  // bloquea hasta que el usuario configure
@@ -1130,11 +1123,7 @@ void setup() {
 
   ssid     = prov_ssid;
   password = prov_password;
-#ifdef USE_MQTT
-  finca_id  = prov_finca_id;
-  mqtt_pass = prov_mqtt_token;
-#endif
-  Serial.printf("[PROV] WiFi: %s  |  Finca: %s\n", prov_ssid, prov_finca_id);
+  Serial.printf("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
 
   Serial.println("Iniciando I2C...");
@@ -1297,12 +1286,30 @@ void setup() {
     Serial.println("WiFi OK: " + WiFi.localIP().toString());
 
 #if !defined(ESP8266) && defined(USE_MQTT)
-    // mqtt_user = MAC del dispositivo (usado por mosquitto-go-auth para lookup)
+    // mqtt_user = MAC del dispositivo (lookup en mosquitto-go-auth)
     static char _mac_buf[20];
     strncpy(_mac_buf, WiFi.macAddress().c_str(), sizeof(_mac_buf) - 1);
     _mac_buf[sizeof(_mac_buf) - 1] = '\0';
     mqtt_user = _mac_buf;
-    Serial.printf("[MQTT] Auth user (MAC): %s\n", mqtt_user);
+
+  #ifndef DEV_MODE
+    // PROD: token pre-flasheado en NVS por el Flash Tool en fábrica
+    if (prov_mqtt_token[0] != '\0') {
+      mqtt_pass = prov_mqtt_token;
+    } else {
+      Serial.println("[MQTT] ADVERTENCIA: sin token NVS — dispositivo no provisionado de fábrica");
+    }
+    // finca_id = MAC hex (identidad del dispositivo; el backend asocia a la finca tras el claim)
+    static char _finca_mac[16];
+    String _mac_nocolon = WiFi.macAddress();
+    _mac_nocolon.replace(":", "");
+    strncpy(_finca_mac, _mac_nocolon.c_str(), sizeof(_finca_mac) - 1);
+    _finca_mac[sizeof(_finca_mac) - 1] = '\0';
+    finca_id = _finca_mac;
+  #endif
+
+    Serial.printf("[MQTT] Auth user (MAC): %s  |  Serial: %s\n",
+                  mqtt_user, device_serial_get());
 #endif
 
     // ── OTA (Over-The-Air) ──────────────────────────────────────────────────

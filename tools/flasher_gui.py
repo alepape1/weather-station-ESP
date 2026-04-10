@@ -15,6 +15,9 @@ import shutil
 import json
 import datetime
 import tempfile
+import secrets as _secrets
+import csv
+import urllib.request
 
 # ── Rutas ─────────────────────────────────────────────────────────────────────
 
@@ -40,6 +43,27 @@ ESPOTA_GLOB_PATTERNS = [
 ]
 
 FQBN = "esp32:esp32:esp32"
+
+BACKEND_URL = "http://127.0.0.1:7000"
+
+# ── Rutas de herramientas adicionales ─────────────────────────────────────────
+
+ESPTOOL_CANDIDATES = [
+    r"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\esptool\esptool.exe",
+    r"C:\Program Files (x86)\Arduino IDE\resources\app\lib\backend\resources\esptool\esptool.exe",
+    "esptool.exe",
+    "esptool",
+    "esptool.py",
+]
+
+NVS_GEN_GLOB_PATTERNS = [
+    os.path.expanduser(
+        r"~\AppData\Local\Arduino15\packages\esp32\tools\esp32-arduino-libs\*\tools\nvs_partition_gen.py"
+    ),
+    os.path.expanduser(
+        r"~\AppData\Local\Arduino15\packages\esp32\hardware\esp32\*\tools\nvs_partition_gen.py"
+    ),
+]
 
 PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
@@ -125,6 +149,134 @@ def export_version_to_temp(git_ref):
 
 
 # ── Herramientas ──────────────────────────────────────────────────────────────
+
+def find_esptool():
+    for path in ESPTOOL_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+        found = shutil.which(path)
+        if found:
+            return found
+    return None
+
+
+def find_nvs_gen():
+    for pattern in NVS_GEN_GLOB_PATTERNS:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[-1]
+    return None
+
+
+# ── Factory provision helpers ─────────────────────────────────────────────────
+
+def fp_read_mac(esptool, port):
+    """Lee la MAC del ESP32 vía esptool. Devuelve 'AA:BB:CC:DD:EE:FF' o None."""
+    cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
+    cmd += ["--port", port, "read_mac"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            if "MAC:" in line.upper():
+                parts = line.upper().split("MAC:")
+                mac = parts[-1].strip().split()[0]
+                return mac.replace("-", ":").upper()
+    except Exception:
+        pass
+    return None
+
+
+def fp_read_flash_id(esptool, port):
+    """Lee el flash_id del ESP32 vía esptool. Devuelve hex string u None."""
+    cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
+    cmd += ["--port", port, "flash_id"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            low = line.lower()
+            if "manufacturer" in low or "flash id" in low or "device" in low:
+                # Extraer el primer token hexadecimal de la línea
+                for token in line.split():
+                    token = token.strip(":").replace("0x", "")
+                    if all(c in "0123456789abcdefABCDEF" for c in token) and len(token) >= 2:
+                        return token.upper().zfill(8)
+    except Exception:
+        pass
+    return None
+
+
+def fp_generate_token():
+    return _secrets.token_urlsafe(32)
+
+
+def fp_hash_token(token):
+    try:
+        import bcrypt as _bcrypt
+        return _bcrypt.hashpw(token.encode(), _bcrypt.gensalt(rounds=12)).decode()
+    except ImportError:
+        return None
+
+
+def fp_register_backend(mac, token_hash, serial_number, backend_url=BACKEND_URL):
+    payload = json.dumps({
+        "mac": mac,
+        "token_hash": token_hash,
+        "serial_number": serial_number,
+    }).encode()
+    req = urllib.request.Request(
+        f"{backend_url}/api/devices/register_factory",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def fp_write_nvs(esptool, nvs_gen, port, serial_number, token):
+    """Genera la partición NVS y la flashea a 0x9000."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "nvs.csv")
+        bin_path = os.path.join(tmpdir, "nvs.bin")
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows([
+                ["key", "type", "encoding", "value"],
+                ["namespace", "namespace", "", "aquantia"],
+                ["mqtt_token",    "data", "string", token],
+                ["serial_number", "data", "string", serial_number],
+            ])
+
+        # Intentar nvs_partition_gen.py de Arduino ESP32
+        ok = False
+        if nvs_gen:
+            r = subprocess.run(
+                [sys.executable, nvs_gen, "generate", csv_path, bin_path, "0x6000"],
+                capture_output=True, text=True, timeout=30
+            )
+            ok = r.returncode == 0
+
+        if not ok:
+            # Fallback: módulo pip esp_idf_nvs_partition_gen
+            r = subprocess.run(
+                [sys.executable, "-m", "esp_idf_nvs_partition_gen",
+                 "--input", csv_path, "--output", bin_path, "--size", "0x6000"],
+                capture_output=True, text=True, timeout=30
+            )
+            ok = r.returncode == 0
+
+        if not ok:
+            raise RuntimeError("nvs_partition_gen no disponible. "
+                               "Instala: pip install esp-idf-nvs-partition-gen")
+
+        # Flashear NVS a 0x9000
+        cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
+        cmd += ["--port", port, "write_flash", "0x9000", bin_path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(f"Error flash NVS: {r.stderr.strip()}")
+
 
 def find_arduino_cli():
     for path in ARDUINO_CLI_CANDIDATES:
@@ -230,9 +382,11 @@ class FlasherApp(tk.Tk):
         self.resizable(False, False)
         self._arduino_cli = find_arduino_cli()
         self._espota       = find_espota()
+        self._esptool      = find_esptool()
+        self._nvs_gen      = find_nvs_gen()
         self._busy         = False
         self._version_list = get_version_list()
-        self._tmp_sketch   = None   # directorio temporal si se usa versión histórica
+        self._tmp_sketch   = None
         self._build_ui()
         self._check_tools()
         self._refresh_binary_status()
@@ -333,21 +487,37 @@ class FlasherApp(tk.Tk):
                                        width=16, command=self._flash_ota)
         self._btn_ota.grid(row=1, column=2, padx=6)
 
+        # ── Factory Provision ──
+        sep = tk.Frame(self, height=1, bg="#dde3ea")
+        sep.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 0))
+
+        fp_frame = tk.Frame(self)
+        fp_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+
+        tk.Label(fp_frame, text="Backend URL:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._backend_var = tk.StringVar(value=BACKEND_URL)
+        ttk.Entry(fp_frame, textvariable=self._backend_var, width=28).pack(
+            side="left", padx=(4, 10))
+        self._btn_factory = ttk.Button(fp_frame, text="🏷  Provisionar fábrica",
+                                       width=22, command=self._factory_provision)
+        self._btn_factory.pack(side="left")
+
         # ── Estado ──
         self._status_var = tk.StringVar(value="Listo")
         tk.Label(self, textvariable=self._status_var,
                  fg="#555", font=("Segoe UI", 8, "italic")).grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=10)
+            row=9, column=0, columnspan=2, sticky="w", padx=10)
 
         # ── Log ──
         tk.Label(self, text="Log:",
                  font=("Segoe UI", 9, "bold")).grid(
-            row=8, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+            row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
         self._log = scrolledtext.ScrolledText(
             self, height=16, width=74,
             bg="#1e1e1e", fg="#d4d4d4",
             font=("Consolas", 9), state="disabled")
-        self._log.grid(row=9, column=0, columnspan=2, padx=10, pady=(0, 10))
+        self._log.grid(row=11, column=0, columnspan=2, padx=10, pady=(0, 10))
         self.columnconfigure(1, weight=1)
 
     # ── Helpers UI ────────────────────────────────────────────────────────────
@@ -380,7 +550,7 @@ class FlasherApp(tk.Tk):
     def _set_busy(self, busy):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for btn in (self._btn_compile, self._btn_serial, self._btn_ota):
+        for btn in (self._btn_compile, self._btn_serial, self._btn_ota, self._btn_factory):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
@@ -422,6 +592,14 @@ class FlasherApp(tk.Tk):
             self._log_line("⚠  espota.py no encontrado (OTA no disponible).", "#f0a000")
         else:
             self._log_line(f"✓  espota.py: {self._espota}", "#4ec9b0")
+        if not self._esptool:
+            self._log_line("⚠  esptool no encontrado (factory provision no disponible).", "#f0a000")
+        else:
+            self._log_line(f"✓  esptool:    {self._esptool}", "#4ec9b0")
+        if not self._nvs_gen:
+            self._log_line("⚠  nvs_partition_gen no encontrado (se usará pip fallback).", "#888")
+        else:
+            self._log_line(f"✓  nvs_gen:    {self._nvs_gen}", "#4ec9b0")
         _, ver_desc, dirty = get_current_version()
         self._log_line(f"✓  Repositorio: {ver_desc}" + (" [modificado]" if dirty else ""), "#4ec9b0")
         self._log_line(f"✓  Build dir:   {BUILD_DIR}", "#4ec9b0")
@@ -566,6 +744,7 @@ class FlasherApp(tk.Tk):
             self._arduino_cli, "compile",
             "--fqbn", FQBN,
             "--build-property", f"build.extra_flags=-DDEVICE_PROFILE={profile}",
+            "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
             sketch_path,
         ]
@@ -674,6 +853,105 @@ class FlasherApp(tk.Tk):
                 self._log_line("\n✗  Flash OTA fallido.\n", "#f44747")
                 self._set_status("Error en flash OTA")
             self._set_busy(False)
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+    # ── Factory Provision ─────────────────────────────────────────────────────
+
+    def _factory_provision(self):
+        """Flujo completo de provisioning de fábrica:
+        1. Lee MAC del dispositivo vía esptool
+        2. Lee Flash Chip ID vía esptool
+        3. Genera token aleatorio + hash bcrypt
+        4. Registra en backend (/api/devices/register_factory)
+        5. Escribe token + serial en NVS (0x9000)
+        6. Muestra serial resultante en el log
+        """
+        if self._busy:
+            return
+        port = self._port_var.get()
+        if not port:
+            messagebox.showwarning("Puerto requerido",
+                                   "Selecciona el puerto COM del dispositivo.")
+            return
+        if not self._esptool:
+            messagebox.showerror("Error",
+                                 "esptool no encontrado.\n"
+                                 "Instala Arduino IDE 2.x o pip install esptool.")
+            return
+
+        self._clear_log()
+        self._set_busy(True)
+
+        def run():
+            try:
+                backend_url = self._backend_var.get().rstrip("/")
+
+                self._log_line("─" * 60, "#444")
+                self._log_line("  FACTORY PROVISION", "#dcdcaa")
+                self._log_line("─" * 60, "#444")
+
+                # 1. Leer MAC
+                self._log_line("\n● Leyendo MAC del dispositivo...", "#569cd6")
+                mac = fp_read_mac(self._esptool, port)
+                if not mac:
+                    self._log_line("✗  No se pudo leer la MAC. Comprueba el puerto y el bootloader.", "#f44747")
+                    return
+                self._log_line(f"  MAC: {mac}", "#4ec9b0")
+
+                # 2. Leer Flash ID
+                self._log_line("\n● Leyendo Flash Chip ID...", "#569cd6")
+                flash_id = fp_read_flash_id(self._esptool, port) or "????????"
+                self._log_line(f"  Flash ID: {flash_id}", "#4ec9b0")
+
+                # 3. Construir serial
+                mac_clean = mac.replace(":", "")
+                serial = f"AQ-{mac_clean}-{flash_id}"
+                self._log_line(f"\n  Serial: {serial}", "#dcdcaa")
+
+                # 4. Generar token
+                self._log_line("\n● Generando token...", "#569cd6")
+                token = fp_generate_token()
+                token_hash = fp_hash_token(token)
+                if not token_hash:
+                    self._log_line("✗  bcrypt no instalado. Ejecuta: pip install bcrypt", "#f44747")
+                    return
+                self._log_line(f"  Token: {token[:12]}…  (hash bcrypt generado)", "#4ec9b0")
+
+                # 5. Registrar en backend
+                self._log_line(f"\n● Registrando en backend ({backend_url})...", "#569cd6")
+                try:
+                    result = fp_register_backend(mac, token_hash, serial, backend_url)
+                    self._log_line(f"  Backend: {result}", "#4ec9b0")
+                except Exception as e:
+                    self._log_line(f"⚠  Backend no disponible: {e}", "#f0a000")
+                    self._log_line("   El dispositivo puede provisionarse igualmente.", "#888")
+                    self._log_line("   Registra manualmente cuando el servidor esté online.", "#888")
+
+                # 6. Escribir NVS
+                self._log_line(f"\n● Escribiendo NVS en {port} (0x9000)...", "#569cd6")
+                try:
+                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token)
+                    self._log_line("✓  NVS escrito correctamente.", "#4ec9b0")
+                except Exception as e:
+                    self._log_line(f"✗  Error NVS: {e}", "#f44747")
+                    return
+
+                # 7. Resultado final
+                self._log_line("\n" + "═" * 60, "#444")
+                self._log_line("  DISPOSITIVO PROVISIONADO", "#4ec9b0")
+                self._log_line(f"  Serial:  {serial}", "#dcdcaa")
+                self._log_line(f"  MAC:     {mac}", "#888")
+                self._log_line("  ➜  Imprime la etiqueta con el QR del serial.", "#888")
+                self._log_line("═" * 60 + "\n", "#444")
+                self._set_status(f"Provisionado: {serial}")
+
+            except Exception as e:
+                self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
+                self._set_status("Error en factory provision")
+            finally:
+                self._set_busy(False)
 
         threading.Thread(target=run, daemon=True).start()
 

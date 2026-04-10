@@ -22,20 +22,34 @@
 // ── Buffers globales de credenciales ─────────────────────────────────────────
 char prov_ssid[64]       = "";
 char prov_password[64]   = "";
-char prov_finca_id[64]   = "";
-char prov_mqtt_token[72] = "";  // token URL-safe (~43 chars) con margen
+char prov_mqtt_token[72] = "";  // token pre-flasheado en fábrica por Flash Tool
 
 #define FACTORY_RESET_PIN 0   // GPIO0 — botón BOOT en casi todos los ESP32
+
+// ── Serial del dispositivo ────────────────────────────────────────────────────
+// Formato: AQ-{MAC 12 hex}-{FlashChipID 8 hex}  ej: AQ-FCB467F37748-001640EF
+// Vinculado al hardware: MAC grabada en eFuse + ID del chip flash.
+// Se usa como identidad del dispositivo en el QR de la etiqueta y en MQTT.
+
+static char _device_serial[48] = "";
+
+const char* device_serial_get() {
+  if (_device_serial[0] != '\0') return _device_serial;
+  String mac = WiFi.macAddress();  // "FC:B4:67:F3:77:48"
+  mac.replace(":", "");            // "FCB467F37748"
+  uint32_t fid = ESP.getFlashChipId();
+  snprintf(_device_serial, sizeof(_device_serial),
+           "AQ-%s-%08X", mac.c_str(), fid);
+  return _device_serial;
+}
 
 // ── NVS ──────────────────────────────────────────────────────────────────────
 
 static Preferences _prov_prefs;
 
 /**
- * Carga credenciales desde NVS al espacio de nombre "aquantia".
- * Los buffers prov_* deben estar pre-rellenados con los valores de fallback
- * (secrets.h) antes de llamar a esta función; solo se sobreescriben si NVS
- * tiene un valor no vacío para esa clave.
+ * Carga credenciales WiFi desde NVS (espacio "aquantia").
+ * Solo sobreescribe los buffers prov_* si NVS tiene valor no vacío.
  */
 void provisioning_load() {
   _prov_prefs.begin("aquantia", /*readOnly=*/true);
@@ -44,31 +58,25 @@ void provisioning_load() {
   if (s.length() > 0) strlcpy(prov_ssid, s.c_str(), sizeof(prov_ssid));
   s = _prov_prefs.getString("password", "");
   if (s.length() > 0) strlcpy(prov_password, s.c_str(), sizeof(prov_password));
-  s = _prov_prefs.getString("finca_id", "");
-  if (s.length() > 0) strlcpy(prov_finca_id, s.c_str(), sizeof(prov_finca_id));
+  // Token pre-flasheado en fábrica — no se escribe desde el portal
   s = _prov_prefs.getString("mqtt_token", "");
   if (s.length() > 0) strlcpy(prov_mqtt_token, s.c_str(), sizeof(prov_mqtt_token));
   _prov_prefs.end();
 }
 
-/** True si SSID y token están presentes (condición mínima para conectar). */
+/** True si SSID está presente (condición mínima para conectar). */
 bool provisioning_has_credentials() {
-  return strlen(prov_ssid) > 0 && strlen(prov_mqtt_token) > 0;
+  return strlen(prov_ssid) > 0;
 }
 
-/** Guarda las credenciales en NVS y actualiza los buffers globales. */
-void provisioning_save(const char* ssid, const char* pass,
-                       const char* finca, const char* token) {
+/** Guarda credenciales WiFi en NVS y actualiza los buffers globales. */
+void provisioning_save(const char* ssid, const char* pass) {
   _prov_prefs.begin("aquantia", /*readOnly=*/false);
-  _prov_prefs.putString("ssid",       ssid);
-  _prov_prefs.putString("password",   pass);
-  _prov_prefs.putString("finca_id",   finca);
-  _prov_prefs.putString("mqtt_token", token);
+  _prov_prefs.putString("ssid",     ssid);
+  _prov_prefs.putString("password", pass);
   _prov_prefs.end();
-  strlcpy(prov_ssid,       ssid,  sizeof(prov_ssid));
-  strlcpy(prov_password,   pass,  sizeof(prov_password));
-  strlcpy(prov_finca_id,   finca, sizeof(prov_finca_id));
-  strlcpy(prov_mqtt_token, token, sizeof(prov_mqtt_token));
+  strlcpy(prov_ssid,     ssid, sizeof(prov_ssid));
+  strlcpy(prov_password, pass, sizeof(prov_password));
 }
 
 /** Borra todas las claves de provisioning del NVS. */
@@ -76,7 +84,7 @@ void provisioning_clear() {
   _prov_prefs.begin("aquantia", /*readOnly=*/false);
   _prov_prefs.clear();
   _prov_prefs.end();
-  prov_ssid[0] = prov_password[0] = prov_finca_id[0] = prov_mqtt_token[0] = '\0';
+  prov_ssid[0] = prov_password[0] = prov_mqtt_token[0] = '\0';
 }
 
 // ── HTML del captive portal ───────────────────────────────────────────────────
@@ -128,6 +136,15 @@ static const char _PROV_HTML[] PROGMEM = R"rawliteral(
             background:#fff;color:#888;font-size:.85rem;cursor:pointer;margin-top:4px}
   .scan-btn:hover{border-color:#0c8ecc;color:#0c8ecc}
   .scanning{color:#0c8ecc;font-size:.82rem;text-align:center;padding:8px}
+
+  /* ── Serial box ── */
+  .serial-box{background:#f0f8fd;border:1.5px solid #b8dff7;border-radius:12px;
+              padding:12px 14px;margin-bottom:16px}
+  .serial-label{font-size:.7rem;font-weight:700;color:#0c8ecc;text-transform:uppercase;
+                letter-spacing:.06em;display:block;margin-bottom:4px}
+  .serial-val{font-family:monospace;font-size:.95rem;font-weight:700;color:#1a2a3a;
+              word-break:break-all;display:block;margin-bottom:4px}
+  .serial-hint{font-size:.72rem;color:#5a8aaa;margin:0}
 </style>
 </head>
 <body>
@@ -135,6 +152,12 @@ static const char _PROV_HTML[] PROGMEM = R"rawliteral(
   <div class="logo">
     <div class="drop">&#128167;</div>
     <div><h2>Aquantia</h2><p class="sub">Configuraci&oacute;n del dispositivo</p></div>
+  </div>
+
+  <div class="serial-box">
+    <span class="serial-label">&#128273; Serial del dispositivo</span>
+    <span class="serial-val">%%SERIAL%%</span>
+    <p class="serial-hint">Usa este c&oacute;digo o el QR de la etiqueta en la app para vincular el dispositivo a tu cuenta.</p>
   </div>
 
   <form method="POST" action="/save">
@@ -147,16 +170,6 @@ static const char _PROV_HTML[] PROGMEM = R"rawliteral(
 
     <label>Contrase&ntilde;a WiFi</label>
     <input name="password" type="password" id="pass-input" autocomplete="off" placeholder="(vac&iacute;o si la red es abierta)">
-
-    <hr class="sep">
-
-    <label>Finca ID</label>
-    <input name="finca_id" type="text" required autocomplete="off" placeholder="mi-finca">
-    <p class="hint">Identificador &uacute;nico de tu instalaci&oacute;n (letras, n&uacute;meros y guiones).</p>
-
-    <label>Token del dispositivo</label>
-    <input name="mqtt_token" type="text" required autocomplete="off" placeholder="Token de la etiqueta">
-    <p class="hint">Impreso en la etiqueta del dispositivo. No lo compartas.</p>
 
     <button type="submit" class="save-btn">Guardar y conectar &rarr;</button>
   </form>
@@ -272,7 +285,10 @@ void provisioning_start_ap() {
   WebServer server(80);
 
   server.on("/", HTTP_GET, [&server]() {
-    server.send_P(200, "text/html; charset=utf-8", _PROV_HTML);
+    // Inyectar el serial del dispositivo en la plantilla HTML
+    String html = FPSTR(_PROV_HTML);
+    html.replace("%%SERIAL%%", device_serial_get());
+    server.send(200, "text/html; charset=utf-8", html);
   });
 
   // Lanzar scan asíncrono al arrancar el portal (no bloquea)
@@ -312,20 +328,18 @@ void provisioning_start_ap() {
   });
 
   server.on("/save", HTTP_POST, [&server]() {
-    String ssid  = server.arg("ssid");
-    String pass  = server.arg("password");
-    String finca = server.arg("finca_id");
-    String token = server.arg("mqtt_token");
+    String ssid = server.arg("ssid");
+    String pass = server.arg("password");
 
-    if (ssid.isEmpty() || finca.isEmpty() || token.isEmpty()) {
-      server.send(400, "text/plain", "Faltan campos obligatorios (ssid, finca_id, mqtt_token)");
+    if (ssid.isEmpty()) {
+      server.send(400, "text/plain", "Falta el SSID de la red WiFi");
       return;
     }
 
-    provisioning_save(ssid.c_str(), pass.c_str(), finca.c_str(), token.c_str());
+    provisioning_save(ssid.c_str(), pass.c_str());
     server.send_P(200, "text/html; charset=utf-8", _PROV_SAVED_HTML);
-    Serial.printf("[PROV] Guardado: ssid=%s finca=%s token=***\n",
-                  ssid.c_str(), finca.c_str());
+    Serial.printf("[PROV] Guardado: ssid=%s serial=%s\n",
+                  ssid.c_str(), device_serial_get());
     delay(2000);
     ESP.restart();
   });
