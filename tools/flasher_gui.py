@@ -897,7 +897,10 @@ class FlasherApp(tk.Tk):
             self._log_line(f"{'─'*60}\n", "#444")
             self._set_status(f"Flasheando OTA a {ip}...")
 
-            cmd = ([sys.executable, self._espota] if self._espota.endswith(".py")
+            # Usar python.exe (con consola) en vez de pythonw.exe para evitar
+            # WinError 10053 (firewall Windows corta conexiones de pythonw)
+            py_exe = sys.executable.replace("pythonw.exe", "python.exe")
+            cmd = ([py_exe, self._espota] if self._espota.endswith(".py")
                    else [self._espota])
             cmd += ["-i", ip, "-p", "3232", "-f", bin_path]
             ok, _ = self._run_cmd(cmd)
