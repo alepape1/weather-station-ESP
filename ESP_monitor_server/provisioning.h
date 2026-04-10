@@ -37,9 +37,7 @@ const char* device_serial_get() {
   if (_device_serial[0] != '\0') return _device_serial;
   String mac = WiFi.macAddress();  // "FC:B4:67:F3:77:48"
   mac.replace(":", "");            // "FCB467F37748"
-  uint32_t fid = ESP.getFlashChipId();
-  snprintf(_device_serial, sizeof(_device_serial),
-           "AQ-%s-%08X", mac.c_str(), fid);
+  snprintf(_device_serial, sizeof(_device_serial), "AQ-%s", mac.c_str());
   return _device_serial;
 }
 
