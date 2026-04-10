@@ -46,6 +46,8 @@ FQBN = "esp32:esp32:esp32"
 
 BACKEND_URL = "http://127.0.0.1:7000"
 
+REGISTRY_FILE = os.path.join(SCRIPT_DIR, "devices_registry.csv")
+
 # ── Rutas de herramientas adicionales ─────────────────────────────────────────
 
 ESPTOOL_CANDIDATES = [
@@ -233,6 +235,22 @@ def fp_register_backend(mac, token_hash, serial_number, backend_url=BACKEND_URL)
         return json.loads(resp.read())
 
 
+def fp_save_registry(serial, mac, profile_label, ver_label):
+    """Añade una fila al CSV de registro de dispositivos provisionados."""
+    file_exists = os.path.isfile(REGISTRY_FILE)
+    with open(REGISTRY_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["fecha", "serial", "mac", "perfil", "version_firmware"])
+        writer.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            serial,
+            mac,
+            profile_label,
+            ver_label,
+        ])
+
+
 def fp_write_nvs(esptool, nvs_gen, port, serial_number, token):
     """Genera la partición NVS y la flashea a 0x9000."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -401,7 +419,13 @@ class FlasherApp(tk.Tk):
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
         tk.Label(hdr, text="💧  Aquantia Flash Tool",
                  bg="#0c8ecc", fg="white",
-                 font=("Segoe UI", 14, "bold"), pady=10).pack()
+                 font=("Segoe UI", 14, "bold"), pady=6).pack()
+        _, ver_desc, dirty = get_current_version()
+        ver_text = ver_desc + (" [modificado]" if dirty else "")
+        self._hdr_ver_var = tk.StringVar(value=f"firmware  {ver_text}")
+        tk.Label(hdr, textvariable=self._hdr_ver_var,
+                 bg="#0c8ecc", fg="#cce8f7",
+                 font=("Consolas", 8), pady=(0)).pack()
 
         # ── Perfil ──
         tk.Label(self, text="Perfil:",
@@ -416,12 +440,17 @@ class FlasherApp(tk.Tk):
         # ── Versión ──
         tk.Label(self, text="Versión:",
                  font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", **PAD)
+        ver_frame = tk.Frame(self)
+        ver_frame.grid(row=2, column=1, sticky="ew", **PAD)
         ver_labels = [v[0] for v in self._version_list]
         self._version_var = tk.StringVar(value=ver_labels[0] if ver_labels else "")
-        self._version_cb  = ttk.Combobox(self, textvariable=self._version_var,
-                                         values=ver_labels, state="readonly", width=38)
-        self._version_cb.grid(row=2, column=1, sticky="ew", **PAD)
+        self._version_cb  = ttk.Combobox(ver_frame, textvariable=self._version_var,
+                                         values=ver_labels, state="readonly", width=33)
+        self._version_cb.pack(side="left")
         self._version_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_binary_status())
+        self._btn_refresh_ver = ttk.Button(ver_frame, text="⟳", width=3,
+                                           command=self._refresh_versions)
+        self._btn_refresh_ver.pack(side="left", padx=4)
 
         # ── Estado del binario ──
         tk.Label(self, text="Binario:",
@@ -550,10 +579,36 @@ class FlasherApp(tk.Tk):
     def _set_busy(self, busy):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for btn in (self._btn_compile, self._btn_serial, self._btn_ota, self._btn_factory):
+        for btn in (self._btn_compile, self._btn_serial, self._btn_ota,
+                    self._btn_factory, self._btn_refresh_ver):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
+
+    def _refresh_versions(self):
+        """git fetch + recarga el selector de versiones."""
+        if self._busy:
+            return
+        self._btn_refresh_ver.config(state="disabled")
+        self._set_status("Buscando versiones nuevas...")
+
+        def run():
+            self._log_line("\n● git fetch...", "#569cd6")
+            _git("fetch", "--tags", "--prune")
+            self._version_list = get_version_list()
+            ver_labels = [v[0] for v in self._version_list]
+            current = ver_labels[0] if ver_labels else ""
+            self._version_cb["values"] = ver_labels
+            self._version_var.set(current)
+            _, ver_desc, dirty = get_current_version()
+            ver_text = ver_desc + (" [modificado]" if dirty else "")
+            self._hdr_ver_var.set(f"firmware  {ver_text}")
+            self._log_line(f"✓  Versiones actualizadas — {ver_text}", "#4ec9b0")
+            self._set_status("Versiones actualizadas")
+            self._btn_refresh_ver.config(state="normal")
+            self._refresh_binary_status()
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _get_selected_ref(self):
         """Devuelve (git_ref | None, label). None = working copy."""
@@ -884,12 +939,17 @@ class FlasherApp(tk.Tk):
         self._clear_log()
         self._set_busy(True)
 
+        profile_label = self._profile_var.get()
+        _, ver_label = self._get_selected_ref()
+
         def run():
             try:
                 backend_url = self._backend_var.get().rstrip("/")
 
                 self._log_line("─" * 60, "#444")
                 self._log_line("  FACTORY PROVISION", "#dcdcaa")
+                self._log_line(f"  Perfil:   {profile_label}", "#888")
+                self._log_line(f"  Firmware: {ver_label}", "#888")
                 self._log_line("─" * 60, "#444")
 
                 # 1. Leer MAC
@@ -900,17 +960,12 @@ class FlasherApp(tk.Tk):
                     return
                 self._log_line(f"  MAC: {mac}", "#4ec9b0")
 
-                # 2. Leer Flash ID
-                self._log_line("\n● Leyendo Flash Chip ID...", "#569cd6")
-                flash_id = fp_read_flash_id(self._esptool, port) or "????????"
-                self._log_line(f"  Flash ID: {flash_id}", "#4ec9b0")
-
-                # 3. Construir serial
+                # 2. Construir serial (AQ-{MAC sin dos puntos})
                 mac_clean = mac.replace(":", "")
-                serial = f"AQ-{mac_clean}-{flash_id}"
-                self._log_line(f"\n  Serial: {serial}", "#dcdcaa")
+                serial = f"AQ-{mac_clean}"
+                self._log_line(f"  Serial: {serial}", "#dcdcaa")
 
-                # 4. Generar token
+                # 3. Generar token
                 self._log_line("\n● Generando token...", "#569cd6")
                 token = fp_generate_token()
                 token_hash = fp_hash_token(token)
@@ -919,17 +974,19 @@ class FlasherApp(tk.Tk):
                     return
                 self._log_line(f"  Token: {token[:12]}…  (hash bcrypt generado)", "#4ec9b0")
 
-                # 5. Registrar en backend
+                # 4. Registrar en backend
                 self._log_line(f"\n● Registrando en backend ({backend_url})...", "#569cd6")
+                backend_ok = False
                 try:
                     result = fp_register_backend(mac, token_hash, serial, backend_url)
                     self._log_line(f"  Backend: {result}", "#4ec9b0")
+                    backend_ok = True
                 except Exception as e:
                     self._log_line(f"⚠  Backend no disponible: {e}", "#f0a000")
-                    self._log_line("   El dispositivo puede provisionarse igualmente.", "#888")
-                    self._log_line("   Registra manualmente cuando el servidor esté online.", "#888")
+                    self._log_line("   NVS se escribirá igualmente.", "#888")
+                    self._log_line("   Registra en backend cuando el servidor esté online.", "#888")
 
-                # 6. Escribir NVS
+                # 5. Escribir NVS
                 self._log_line(f"\n● Escribiendo NVS en {port} (0x9000)...", "#569cd6")
                 try:
                     fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token)
@@ -938,12 +995,22 @@ class FlasherApp(tk.Tk):
                     self._log_line(f"✗  Error NVS: {e}", "#f44747")
                     return
 
+                # 6. Guardar en registro local CSV
+                try:
+                    fp_save_registry(serial, mac, profile_label, ver_label)
+                    self._log_line(f"✓  Registro guardado: {REGISTRY_FILE}", "#4ec9b0")
+                except Exception as e:
+                    self._log_line(f"⚠  No se pudo guardar el registro: {e}", "#f0a000")
+
                 # 7. Resultado final
                 self._log_line("\n" + "═" * 60, "#444")
-                self._log_line("  DISPOSITIVO PROVISIONADO", "#4ec9b0")
-                self._log_line(f"  Serial:  {serial}", "#dcdcaa")
-                self._log_line(f"  MAC:     {mac}", "#888")
-                self._log_line("  ➜  Imprime la etiqueta con el QR del serial.", "#888")
+                self._log_line("  DISPOSITIVO PROVISIONADO" + ("" if backend_ok else "  (pendiente registro backend)"), "#4ec9b0")
+                self._log_line(f"  Serial:   {serial}", "#dcdcaa")
+                self._log_line(f"  MAC:      {mac}", "#888")
+                self._log_line(f"  Perfil:   {profile_label}", "#888")
+                self._log_line(f"  Firmware: {ver_label}", "#888")
+                self._log_line(f"  Registro: {REGISTRY_FILE}", "#888")
+                self._log_line("  ➜  Imprime la etiqueta con el QR del serial.", "#569cd6")
                 self._log_line("═" * 60 + "\n", "#444")
                 self._set_status(f"Provisionado: {serial}")
 
