@@ -18,6 +18,12 @@ import tempfile
 import secrets as _secrets
 import csv
 import urllib.request
+try:
+    import qrcode
+    from PIL import ImageTk
+    _QR_AVAILABLE = True
+except ImportError:
+    _QR_AVAILABLE = False
 
 # ── Rutas ─────────────────────────────────────────────────────────────────────
 
@@ -44,9 +50,11 @@ ESPOTA_GLOB_PATTERNS = [
 
 FQBN = "esp32:esp32:esp32"
 
-BACKEND_URL = "http://127.0.0.1:7000"
+BACKEND_URL  = "https://meteo.aquantialab.com"
+APP_BASE_URL = "https://meteo.aquantialab.com"   # URL base del QR de claim
 
 REGISTRY_FILE = os.path.join(SCRIPT_DIR, "devices_registry.csv")
+REGISTRY_QR_DIR = os.path.join(SCRIPT_DIR, "devices_qr")
 
 # ── Rutas de herramientas adicionales ─────────────────────────────────────────
 
@@ -235,19 +243,66 @@ def fp_register_backend(mac, token_hash, serial_number, backend_url=BACKEND_URL)
         return json.loads(resp.read())
 
 
+def show_qr_window(serial, mac):
+    """Abre una ventana con el QR del serial del dispositivo."""
+    if not _QR_AVAILABLE:
+        messagebox.showwarning(
+            "qrcode no instalado",
+            "Instala la librería para generar QR:\n\npip install qrcode[pil]"
+        )
+        return
+
+    win = tk.Toplevel()
+    win.title(f"Etiqueta — {serial}")
+    win.resizable(False, False)
+    win.configure(bg="#1e1e1e")
+
+    img = qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}")
+    img = img.resize((220, 220))
+    tk_img = ImageTk.PhotoImage(img)
+
+    lbl_qr = tk.Label(win, image=tk_img, bg="#1e1e1e", bd=0)
+    lbl_qr.image = tk_img  # mantener referencia
+    lbl_qr.pack(padx=20, pady=(20, 8))
+
+    tk.Label(win, text=serial, font=("Courier New", 13, "bold"),
+             bg="#1e1e1e", fg="#dcdcaa").pack()
+    tk.Label(win, text=mac, font=("Segoe UI", 9),
+             bg="#1e1e1e", fg="#888").pack(pady=(2, 12))
+
+    def save_png():
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            initialfile=f"{serial}.png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if path:
+            qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(path)
+
+    ttk.Button(win, text="Guardar PNG", command=save_png).pack(pady=(0, 16))
+
+
 def fp_save_registry(serial, mac, profile_label, ver_label):
-    """Añade una fila al CSV de registro de dispositivos provisionados."""
+    """Añade una fila al CSV de registro y guarda el PNG del QR en devices_qr/."""
     file_exists = os.path.isfile(REGISTRY_FILE)
     with open(REGISTRY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["fecha", "serial", "mac", "perfil", "version_firmware"])
+            writer.writerow(["fecha", "serial", "mac", "perfil", "version_firmware", "qr_png"])
+        qr_path = ""
+        if _QR_AVAILABLE:
+            os.makedirs(REGISTRY_QR_DIR, exist_ok=True)
+            qr_path = os.path.join(REGISTRY_QR_DIR, f"{serial}.png")
+            if not os.path.isfile(qr_path):
+                qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(qr_path)
         writer.writerow([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             serial,
             mac,
             profile_label,
             ver_label,
+            qr_path,
         ])
 
 
@@ -277,9 +332,10 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token):
 
         if not ok:
             # Fallback: módulo pip esp_idf_nvs_partition_gen
+            # Sintaxis: generate <input> <output> <size>
             r = subprocess.run(
                 [sys.executable, "-m", "esp_idf_nvs_partition_gen",
-                 "--input", csv_path, "--output", bin_path, "--size", "0x6000"],
+                 "generate", csv_path, bin_path, "0x6000"],
                 capture_output=True, text=True, timeout=30
             )
             ok = r.returncode == 0
@@ -947,7 +1003,7 @@ class FlasherApp(tk.Tk):
 
         def run():
             try:
-                backend_url = self._backend_var.get().rstrip("/")
+                backend_url = self._backend_var.get().strip().rstrip("/")
 
                 self._log_line("─" * 60, "#444")
                 self._log_line("  FACTORY PROVISION", "#dcdcaa")
@@ -1013,9 +1069,9 @@ class FlasherApp(tk.Tk):
                 self._log_line(f"  Perfil:   {profile_label}", "#888")
                 self._log_line(f"  Firmware: {ver_label}", "#888")
                 self._log_line(f"  Registro: {REGISTRY_FILE}", "#888")
-                self._log_line("  ➜  Imprime la etiqueta con el QR del serial.", "#569cd6")
                 self._log_line("═" * 60 + "\n", "#444")
                 self._set_status(f"Provisionado: {serial}")
+                self.after(100, lambda s=serial, m=mac: show_qr_window(s, m))
 
             except Exception as e:
                 self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
