@@ -820,17 +820,21 @@ class FlasherApp(tk.Tk):
         self._update_commit_info(git_ref)
 
     def _start_progress(self, mode="indeterminate"):
-        """Arranca la barra de progreso."""
-        self._pb.config(mode=mode, value=0)
-        if mode == "indeterminate":
-            self._pb.start(12)
-        else:
-            self._pb.config(maximum=100)
+        """Arranca la barra de progreso (seguro desde cualquier hilo)."""
+        def _do():
+            self._pb.config(mode=mode, value=0)
+            if mode == "indeterminate":
+                self._pb.start(12)
+            else:
+                self._pb.config(maximum=100)
+        self.after(0, _do)
 
     def _stop_progress(self, success=True):
-        """Para la barra de progreso y la llena (verde=ok, vacía=error)."""
-        self._pb.stop()
-        self._pb.config(mode="determinate", value=100 if success else 0)
+        """Para la barra de progreso (seguro desde cualquier hilo)."""
+        def _do():
+            self._pb.stop()
+            self._pb.config(mode="determinate", value=100 if success else 0)
+        self.after(0, _do)
 
     def _set_progress(self, value):
         """Actualiza el valor de la barra (0-100) desde cualquier hilo."""
@@ -936,8 +940,12 @@ class FlasherApp(tk.Tk):
                         self._set_progress(pct)
                         break
 
-                # ── Progreso flash (porcentaje explícito en la salida) ──
-                m = re.search(r'(\d{1,3})\s*%', line)
+                # ── Progreso flash (formatos reales de esptool / espota) ──
+                # esptool USB:  "Writing at 0x00010000... (10 %)"
+                # espota OTA:   "[=========   ] 35%"
+                m = re.search(r'\(\s*(\d+)\s*%\s*\)', line)   # esptool: (10 %)
+                if not m:
+                    m = re.search(r'\]\s*(\d+)%', line)        # espota:  ] 35%
                 if m:
                     pct = min(int(m.group(1)), 100)
                     self._set_progress(pct)
