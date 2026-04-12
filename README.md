@@ -161,7 +161,7 @@ Editar `User_Setup_Select.h` de la librería:
 
 ## secrets.h — modo DEV
 
-Crear `ESP_monitor_server/secrets.h` (excluido del repo):
+Crear `ESP_monitor_server/secrets.h` (excluido del repo vía `.gitignore`):
 
 ```cpp
 // secrets.h — NO subir al repositorio
@@ -169,6 +169,9 @@ Crear `ESP_monitor_server/secrets.h` (excluido del repo):
 // ── Modo DEV — activo: usa estas credenciales directamente (sin portal SoftAP)
 //              inactivo: el dispositivo usa NVS / portal SoftAP en primer arranque
 #define DEV_MODE
+
+// ── Perfil de hardware (solo si no es METEO, que es el valor por defecto) ─────
+// #define DEVICE_PROFILE PROFILE_IRRIGATION   // ← descomentar para placa riego
 
 // ── WiFi (solo DEV_MODE) ──────────────────────────────────────────────────────
 #define WIFI_SSID     "TU_RED_WIFI"
@@ -182,12 +185,29 @@ Crear `ESP_monitor_server/secrets.h` (excluido del repo):
 #define USE_MQTT
 #define MQTT_SERVER  "meteo.aquantialab.com"
 #define MQTT_PORT    8883
-#define FINCA_ID     "AQ-FCB467F37748"       // serial del dispositivo
-#define MQTT_USER    "AQ-FCB467F37748"
-#define MQTT_PASS    "token_del_dispositivo"
+#define FINCA_ID     "finca-dev"
+
+// En DEV_MODE el broker acepta el usuario interno "backend":
+#define MQTT_USER    "backend"
+#define MQTT_PASS    "aquantia_159"   // valor de MQTT_PASSWORD en el .env del servidor
 ```
 
 En modo **PROD** (sin `DEV_MODE`), las credenciales WiFi y el token MQTT vienen de la NVS escrita por la Flash Tool durante el factory provision. El `secrets.h` solo necesita las constantes de compilación (`USE_MQTT`, `MQTT_SERVER`, `MQTT_PORT`).
+
+### Diferencia DEV / PROD en la autenticación MQTT
+
+Este es el punto más importante. En función del modo, el firmware usa **credenciales distintas** para conectar al broker:
+
+| | `DEV_MODE` activo | `DEV_MODE` inactivo (PROD) |
+|--|--|--|
+| **Usuario MQTT** | `MQTT_USER` de `secrets.h` → `"backend"` | MAC del dispositivo → `"FC:B4:67:F3:77:48"` |
+| **Contraseña MQTT** | `MQTT_PASS` de `secrets.h` | Token generado en fábrica, leído de NVS |
+| **WiFi** | `WIFI_SSID` / `WIFI_PASSWORD` de `secrets.h` | SSID + contraseña guardados en NVS |
+| **Provisioning** | Saltado | Portal SoftAP en primer arranque |
+
+El motivo es que en PROD el broker identifica cada dispositivo **por su MAC** y verifica el token con un hash bcrypt almacenado en la base de datos. En DEV, en cambio, no existe ese token todavía (el dispositivo no ha pasado por fábrica), así que se usa el usuario interno `backend` que el broker acepta directamente comparando la contraseña con la variable de entorno `MQTT_PASSWORD`.
+
+> **Nota de implementación:** en el firmware, la sobreescritura `mqtt_user = MAC` está dentro de un bloque `#ifndef DEV_MODE`. Sin ese guard, el usuario de `secrets.h` quedaría siempre machacado por la MAC tras la conexión WiFi, haciendo inefectivo el `MQTT_USER` en DEV.
 
 ---
 
@@ -263,6 +283,31 @@ Modo de comunicación principal. Activar definiendo `USE_MQTT` en `secrets.h`.
   "mac_address":           "FC:B4:67:F3:77:48"
 }
 ```
+
+### Autenticación MQTT — flujo completo
+
+El broker usa el plugin **mosquitto-go-auth**, que delega la validación a un webhook HTTP al backend Flask en cada intento de conexión:
+
+```
+ESP32                   Mosquitto               Backend Flask
+  │                         │                        │
+  │── CONNECT (user/pass) ──►│                        │
+  │                         │── POST /api/mqtt/auth ─►│
+  │                         │   {"username":…,        │
+  │                         │    "password":…}        │
+  │                         │                        │ (valida)
+  │                         │◄── 200 OK ─────────────│
+  │◄── CONNACK (rc=0) ──────│                        │
+```
+
+El backend acepta **dos tipos de credenciales**:
+
+| Tipo | `username` | `password` | Cuándo se usa |
+|------|-----------|-----------|---------------|
+| Usuario interno | `"backend"` | Valor de `MQTT_PASSWORD` en `.env` | DEV_MODE, backend Flask propio |
+| Dispositivo | MAC del chip (`"FC:B4:67:F3:77:48"`) | Token generado en fábrica (bcrypt en DB) | PROD, dispositivos reales |
+
+Si el broker no puede alcanzar el backend, deniega todas las conexiones.
 
 ### TLS — certificado ISRG Root X1
 

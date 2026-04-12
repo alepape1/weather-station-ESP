@@ -1369,13 +1369,13 @@ void setup() {
     Serial.println("WiFi OK: " + WiFi.localIP().toString());
 
 #if !defined(ESP8266) && defined(USE_MQTT)
-    // mqtt_user = MAC del dispositivo (lookup en mosquitto-go-auth)
+  #ifndef DEV_MODE
+    // PROD: mqtt_user = MAC del dispositivo (lookup en mosquitto-go-auth)
     static char _mac_buf[20];
     strncpy(_mac_buf, WiFi.macAddress().c_str(), sizeof(_mac_buf) - 1);
     _mac_buf[sizeof(_mac_buf) - 1] = '\0';
     mqtt_user = _mac_buf;
 
-  #ifndef DEV_MODE
     // PROD: token pre-flasheado en NVS por el Flash Tool en fábrica
     if (prov_mqtt_token[0] != '\0') {
       mqtt_pass = prov_mqtt_token;
@@ -1391,7 +1391,7 @@ void setup() {
     finca_id = _finca_mac;
   #endif
 
-    Serial.printf("[MQTT] Auth user (MAC): %s  |  Serial: %s\n",
+    Serial.printf("[MQTT] Auth user: %s  |  Serial: %s\n",
                   mqtt_user, device_serial_get());
 #endif
 
