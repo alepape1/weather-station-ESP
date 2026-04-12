@@ -680,6 +680,9 @@ class FlasherApp(tk.Tk):
         self._btn_factory = ttk.Button(fp_frame, text="🏷  Provisionar fábrica",
                                        width=22, command=self._factory_provision)
         self._btn_factory.pack(side="left")
+        self._btn_erase_nvs = ttk.Button(fp_frame, text="🗑 Borrar NVS",
+                                         width=14, command=self._erase_nvs)
+        self._btn_erase_nvs.pack(side="left", padx=(8, 0))
 
         # ── Estado ──
         self._status_var = tk.StringVar(value="Listo")
@@ -729,7 +732,7 @@ class FlasherApp(tk.Tk):
         self._busy = busy
         state = "disabled" if busy else "normal"
         for btn in (self._btn_compile, self._btn_serial, self._btn_ota,
-                    self._btn_factory, self._btn_refresh_ver,
+                    self._btn_factory, self._btn_erase_nvs, self._btn_refresh_ver,
                     self._btn_discover_ota):
             btn.config(state=state)
         if not busy:
@@ -1302,6 +1305,74 @@ class FlasherApp(tk.Tk):
             except Exception as e:
                 self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
                 self._set_status("Error en factory provision")
+            finally:
+                self._set_busy(False)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ── Borrar NVS ────────────────────────────────────────────────────────────
+
+    def _erase_nvs(self):
+        """Borra la partición NVS del ESP32 (0x9000, 0x6000 bytes).
+        Elimina credenciales WiFi, token MQTT y serial almacenados.
+        El dispositivo arrancará en modo SoftAP la próxima vez.
+        """
+        if self._busy:
+            return
+        port = self._port_var.get()
+        if not port:
+            messagebox.showwarning("Puerto requerido",
+                                   "Selecciona el puerto COM del dispositivo.")
+            return
+        if not self._esptool:
+            messagebox.showerror("Error",
+                                 "esptool no encontrado.\n"
+                                 "Instala Arduino IDE 2.x o pip install esptool.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Confirmar borrado NVS",
+            "¿Borrar la partición NVS del dispositivo?\n\n"
+            "Esto eliminará:\n"
+            "  • Credenciales WiFi configuradas\n"
+            "  • Token MQTT de fábrica\n"
+            "  • Serial number almacenado\n\n"
+            "El dispositivo arrancará en modo SoftAP la próxima vez.\n\n"
+            f"Puerto: {port}",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        self._clear_log()
+        self._set_busy(True)
+
+        def run():
+            try:
+                self._start_progress("indeterminate")
+                self._log_line("─" * 60, "#444")
+                self._log_line("  BORRAR NVS  (0x9000 · 0x6000 bytes)", "#dcdcaa")
+                self._log_line(f"  Puerto: {port}", "#888")
+                self._log_line("─" * 60, "#444")
+                self._set_status("Borrando NVS...")
+
+                cmd = ([sys.executable, self._esptool]
+                       if self._esptool.endswith(".py") else [self._esptool])
+                cmd += ["--port", port, "erase_region", "0x9000", "0x6000"]
+
+                ok, _ = self._run_cmd(cmd)
+                self._stop_progress(ok)
+                if ok:
+                    self._log_line("\n✓  NVS borrada correctamente.", "#4ec9b0")
+                    self._log_line("   El dispositivo arrancará en modo SoftAP la próxima vez.", "#888")
+                    self._set_status("NVS borrada — re-flashea o configura por SoftAP")
+                else:
+                    self._log_line("\n✗  Error al borrar NVS.", "#f44747")
+                    self._log_line("   Asegúrate de que el dispositivo está en modo bootloader.", "#888")
+                    self._set_status("Error al borrar NVS")
+            except Exception as e:
+                self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
+                self._set_status("Error al borrar NVS")
             finally:
                 self._set_busy(False)
 
