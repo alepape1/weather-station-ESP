@@ -18,12 +18,20 @@ import tempfile
 import secrets as _secrets
 import csv
 import urllib.request
+import re
+import socket
+import time
 try:
     import qrcode
     from PIL import ImageTk
     _QR_AVAILABLE = True
 except ImportError:
     _QR_AVAILABLE = False
+try:
+    from zeroconf import ServiceBrowser, Zeroconf
+    _ZEROCONF = True
+except ImportError:
+    _ZEROCONF = False
 
 # ── Rutas ─────────────────────────────────────────────────────────────────────
 
@@ -126,6 +134,23 @@ def get_version_list():
             versions.append((f"{ref}  —  {msg}", ref))
 
     return versions
+
+
+def get_commit_details(git_ref):
+    """Devuelve dict con hash, date, author y body del commit dado."""
+    ref = git_ref if git_ref else "HEAD"
+    raw = _git("log", "-1",
+               "--format=%H%n%ad%n%an%n%B",
+               "--date=format:%Y-%m-%d %H:%M", ref)
+    if not raw:
+        return None
+    parts = raw.split("\n", 3)
+    return {
+        "hash":   parts[0][:12]     if len(parts) > 0 else "",
+        "date":   parts[1]          if len(parts) > 1 else "",
+        "author": parts[2]          if len(parts) > 2 else "",
+        "body":   parts[3].strip()  if len(parts) > 3 else "",
+    }
 
 
 def export_version_to_temp(git_ref):
@@ -370,6 +395,39 @@ def find_espota():
     return shutil.which("espota.py") or shutil.which("espota")
 
 
+def discover_ota_devices(timeout=4):
+    """
+    Descubre dispositivos ESP32 con ArduinoOTA activo en la red local.
+    Usa mDNS (_arduino._tcp) via zeroconf si está instalado,
+    o resuelve hostnames conocidos como fallback.
+    Devuelve lista de (nombre, ip, puerto).
+    """
+    found = []
+    if _ZEROCONF:
+        class _Listener:
+            def add_service(self, zc, type_, name):
+                info = zc.get_service_info(type_, name)
+                if info and info.addresses:
+                    ip = socket.inet_ntoa(info.addresses[0])
+                    label = name.replace("._arduino._tcp.local.", "")
+                    found.append((label, ip, info.port or 3232))
+            def remove_service(self, *_): pass
+            def update_service(self, *_): pass
+        zc = Zeroconf()
+        ServiceBrowser(zc, "_arduino._tcp.local.", _Listener())
+        time.sleep(timeout)
+        zc.close()
+    else:
+        # Fallback: intentar resolver hostnames conocidos
+        for hostname in ["meteostation-esp32", "aquantia-device"]:
+            try:
+                ip = socket.gethostbyname(f"{hostname}.local")
+                found.append((hostname, ip, 3232))
+            except socket.gaierror:
+                pass
+    return found
+
+
 def list_com_ports():
     try:
         from serial.tools import list_ports
@@ -486,7 +544,7 @@ class FlasherApp(tk.Tk):
         # ── Perfil ──
         tk.Label(self, text="Perfil:",
                  font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", **PAD)
-        self._profile_var = tk.StringVar(value=list(PROFILES.keys())[1])  # default: irrigation
+        self._profile_var = tk.StringVar(value=list(PROFILES.keys())[1])
         profile_cb = ttk.Combobox(self, textvariable=self._profile_var,
                                   values=list(PROFILES.keys()),
                                   state="readonly", width=38)
@@ -503,16 +561,34 @@ class FlasherApp(tk.Tk):
         self._version_cb  = ttk.Combobox(ver_frame, textvariable=self._version_var,
                                          values=ver_labels, state="readonly", width=33)
         self._version_cb.pack(side="left")
-        self._version_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_binary_status())
+        self._version_cb.bind("<<ComboboxSelected>>", self._on_version_selected)
         self._btn_refresh_ver = ttk.Button(ver_frame, text="⟳", width=3,
                                            command=self._refresh_versions)
         self._btn_refresh_ver.pack(side="left", padx=4)
 
+        # ── Info del commit ──
+        tk.Label(self, text="Commit:",
+                 font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="nw", **PAD)
+        commit_frame = tk.Frame(self, bg="#252526", bd=1, relief="sunken")
+        commit_frame.grid(row=3, column=1, sticky="ew", padx=10, pady=(2, 4))
+        self._commit_text = tk.Text(
+            commit_frame, height=3, width=40,
+            bg="#252526", fg="#cccccc", font=("Consolas", 8),
+            state="disabled", wrap="word", bd=0,
+            selectbackground="#264f78")
+        self._commit_text.pack(fill="both", expand=True, padx=4, pady=2)
+        # Configurar tags de color
+        self._commit_text.tag_config("hash",   foreground="#569cd6")
+        self._commit_text.tag_config("meta",   foreground="#888888")
+        self._commit_text.tag_config("body",   foreground="#d4d4d4")
+        self._commit_text.tag_config("dirty",  foreground="#f0a000")
+        self._update_commit_info(None)
+
         # ── Estado del binario ──
         tk.Label(self, text="Binario:",
-                 font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w", **PAD)
+                 font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky="w", **PAD)
         bin_frame = tk.Frame(self)
-        bin_frame.grid(row=3, column=1, sticky="ew", **PAD)
+        bin_frame.grid(row=4, column=1, sticky="ew", **PAD)
         self._bin_status_var = tk.StringVar(value="Comprobando...")
         self._bin_status_lbl = tk.Label(bin_frame, textvariable=self._bin_status_var,
                                         font=("Segoe UI", 9), anchor="w")
@@ -522,9 +598,9 @@ class FlasherApp(tk.Tk):
 
         # ── Puerto COM ──
         tk.Label(self, text="Puerto USB:",
-                 font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky="w", **PAD)
+                 font=("Segoe UI", 9, "bold")).grid(row=5, column=0, sticky="w", **PAD)
         port_frame = tk.Frame(self)
-        port_frame.grid(row=4, column=1, sticky="ew", **PAD)
+        port_frame.grid(row=5, column=1, sticky="ew", **PAD)
         self._port_var = tk.StringVar()
         self._port_cb  = ttk.Combobox(port_frame, textvariable=self._port_var,
                                       state="readonly", width=28)
@@ -533,16 +609,33 @@ class FlasherApp(tk.Tk):
                    command=self._refresh_ports).pack(side="left", padx=4)
         self._refresh_ports()
 
-        # ── IP OTA ──
+        # ── IP OTA + descubrimiento de dispositivos ──
         tk.Label(self, text="IP OTA:",
-                 font=("Segoe UI", 9, "bold")).grid(row=5, column=0, sticky="w", **PAD)
+                 font=("Segoe UI", 9, "bold")).grid(row=6, column=0, sticky="w", **PAD)
+        ota_frame = tk.Frame(self)
+        ota_frame.grid(row=6, column=1, sticky="ew", **PAD)
         self._ip_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self._ip_var, width=40).grid(
-            row=5, column=1, sticky="ew", **PAD)
+        tk.Entry(ota_frame, textvariable=self._ip_var, width=18,
+                 font=("Consolas", 9)).pack(side="left")
+        self._btn_discover_ota = ttk.Button(ota_frame, text="🔍 Buscar",
+                                            width=10, command=self._discover_ota)
+        self._btn_discover_ota.pack(side="left", padx=(6, 0))
+        # Combobox de dispositivos encontrados (oculto hasta que haya resultados)
+        self._ota_devices_var = tk.StringVar()
+        self._ota_devices_cb  = ttk.Combobox(ota_frame, textvariable=self._ota_devices_var,
+                                              state="readonly", width=24)
+        self._ota_devices_cb.pack(side="left", padx=(6, 0))
+        self._ota_devices_cb.bind("<<ComboboxSelected>>", self._on_ota_device_selected)
+        self._ota_found = []   # lista de (nombre, ip, puerto)
+
+        # ── Barra de progreso ──
+        self._pb = ttk.Progressbar(self, orient="horizontal",
+                                   mode="indeterminate", length=400)
+        self._pb.grid(row=7, column=0, columnspan=2, padx=10, pady=(2, 0), sticky="ew")
 
         # ── Botones ──
         btn_frame = tk.Frame(self)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=8)
+        btn_frame.grid(row=8, column=0, columnspan=2, pady=8)
         # ── Modo DEV / PROD ──
         self._dev_mode_var = tk.BooleanVar(value=self._read_dev_mode())
         mode_frame = tk.Frame(btn_frame)
@@ -574,10 +667,10 @@ class FlasherApp(tk.Tk):
 
         # ── Factory Provision ──
         sep = tk.Frame(self, height=1, bg="#dde3ea")
-        sep.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 0))
+        sep.grid(row=9, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 0))
 
         fp_frame = tk.Frame(self)
-        fp_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        fp_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
         tk.Label(fp_frame, text="Backend URL:",
                  font=("Segoe UI", 9, "bold")).pack(side="left")
@@ -592,17 +685,17 @@ class FlasherApp(tk.Tk):
         self._status_var = tk.StringVar(value="Listo")
         tk.Label(self, textvariable=self._status_var,
                  fg="#555", font=("Segoe UI", 8, "italic")).grid(
-            row=9, column=0, columnspan=2, sticky="w", padx=10)
+            row=11, column=0, columnspan=2, sticky="w", padx=10)
 
         # ── Log ──
         tk.Label(self, text="Log:",
                  font=("Segoe UI", 9, "bold")).grid(
-            row=10, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
+            row=12, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
         self._log = scrolledtext.ScrolledText(
             self, height=16, width=74,
             bg="#1e1e1e", fg="#d4d4d4",
             font=("Consolas", 9), state="disabled")
-        self._log.grid(row=11, column=0, columnspan=2, padx=10, pady=(0, 10))
+        self._log.grid(row=13, column=0, columnspan=2, padx=10, pady=(0, 10))
         self.columnconfigure(1, weight=1)
 
     # ── Helpers UI ────────────────────────────────────────────────────────────
@@ -636,7 +729,8 @@ class FlasherApp(tk.Tk):
         self._busy = busy
         state = "disabled" if busy else "normal"
         for btn in (self._btn_compile, self._btn_serial, self._btn_ota,
-                    self._btn_factory, self._btn_refresh_ver):
+                    self._btn_factory, self._btn_refresh_ver,
+                    self._btn_discover_ota):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
@@ -694,6 +788,101 @@ class FlasherApp(tk.Tk):
             self._log_line(f"Error limpiando build: {e}", "#f44747")
         self._refresh_binary_status()
 
+    def _update_commit_info(self, git_ref):
+        """Actualiza el panel de info del commit seleccionado."""
+        details = get_commit_details(git_ref)
+        self._commit_text.config(state="normal")
+        self._commit_text.delete("1.0", "end")
+        if details:
+            self._commit_text.insert("end", details["hash"], "hash")
+            self._commit_text.insert("end", f"  {details['date']}  {details['author']}\n", "meta")
+            body = details["body"]
+            if body:
+                # Primera línea = asunto
+                lines = body.split("\n", 1)
+                subject = lines[0]
+                rest    = lines[1].strip() if len(lines) > 1 else ""
+                self._commit_text.insert("end", subject + "\n", "body")
+                if rest:
+                    self._commit_text.insert("end", rest[:120], "meta")
+        else:
+            _, _, dirty = get_current_version()
+            if dirty:
+                self._commit_text.insert("end", "Working copy — cambios sin commit", "dirty")
+            else:
+                self._commit_text.insert("end", "(sin información de commit)", "meta")
+        self._commit_text.config(state="disabled")
+
+    def _on_version_selected(self, _event=None):
+        """Maneja la selección de versión: actualiza estado y commit info."""
+        git_ref, _ = self._get_selected_ref()
+        self._refresh_binary_status()
+        self._update_commit_info(git_ref)
+
+    def _start_progress(self, mode="indeterminate"):
+        """Arranca la barra de progreso."""
+        self._pb.config(mode=mode, value=0)
+        if mode == "indeterminate":
+            self._pb.start(12)
+        else:
+            self._pb.config(maximum=100)
+
+    def _stop_progress(self, success=True):
+        """Para la barra de progreso y la llena (verde=ok, vacía=error)."""
+        self._pb.stop()
+        self._pb.config(mode="determinate", value=100 if success else 0)
+
+    def _set_progress(self, value):
+        """Actualiza el valor de la barra (0-100) desde cualquier hilo."""
+        self.after(0, lambda v=value: self._pb.config(value=v))
+
+    def _discover_ota(self):
+        """Busca dispositivos OTA en la red local (en background)."""
+        if self._busy:
+            return
+        self._btn_discover_ota.config(state="disabled")
+        self._ota_devices_cb["values"] = []
+        self._ota_devices_var.set("")
+        self._set_status("Buscando dispositivos OTA en la red...")
+        self._log_line("\n● Buscando dispositivos ArduinoOTA (_arduino._tcp)...", "#569cd6")
+        if not _ZEROCONF:
+            self._log_line("  zeroconf no instalado — usando resolución .local de fallback", "#888")
+            self._log_line("  Instala con: pip install zeroconf", "#888")
+
+        def run():
+            devices = discover_ota_devices(timeout=4)
+            def on_done():
+                self._ota_found = devices
+                if devices:
+                    labels = [f"{name}  ({ip}:{port})"
+                              for name, ip, port in devices]
+                    self._ota_devices_cb["values"] = labels
+                    self._ota_devices_var.set(labels[0])
+                    # Auto-rellenar IP si solo hay uno
+                    if len(devices) == 1:
+                        self._ip_var.set(devices[0][1])
+                    self._log_line(f"✓  {len(devices)} dispositivo(s) encontrado(s):", "#4ec9b0")
+                    for name, ip, port in devices:
+                        self._log_line(f"   {name}  →  {ip}:{port}", "#dcdcaa")
+                    self._set_status(f"{len(devices)} dispositivo(s) OTA encontrado(s)")
+                else:
+                    self._log_line("⚠  No se encontraron dispositivos OTA.", "#f0a000")
+                    self._log_line("   Asegúrate de que el ESP32 está encendido y en la misma red.", "#888")
+                    self._set_status("Sin dispositivos OTA")
+                self._btn_discover_ota.config(state="normal")
+            self.after(0, on_done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_ota_device_selected(self, _event=None):
+        """Rellena el campo IP al seleccionar un dispositivo OTA."""
+        sel = self._ota_devices_var.get()
+        for label, (name, ip, port) in zip(
+                self._ota_devices_cb["values"], self._ota_found):
+            if label == sel:
+                self._ip_var.set(ip)
+                break
+
     def _check_tools(self):
         if not self._arduino_cli:
             self._log_line("⚠  arduino-cli no encontrado. Instala Arduino IDE 2.x.", "#f0a000")
@@ -718,8 +907,15 @@ class FlasherApp(tk.Tk):
 
     # ── Subprocesos ───────────────────────────────────────────────────────────
 
-    def _run_cmd(self, cmd, cwd=None):
+    def _run_cmd(self, cmd, cwd=None, progress_mode="determinate"):
         self._log_line(f"$ {' '.join(str(x) for x in cmd)}", "#569cd6")
+        # Hitos de compilación → porcentaje aproximado
+        _compile_milestones = {
+            "compiling libraries":           20,
+            "compiling sketch":              55,
+            "generating compilation":        75,
+            "linking everything together":   88,
+        }
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -732,6 +928,20 @@ class FlasherApp(tk.Tk):
                          else "#ce9178" if "warning:" in line.lower()
                          else None)
                 self._log_line(line, color)
+
+                # ── Progreso compilación (milestones conocidos) ──
+                ll = line.lower()
+                for milestone, pct in _compile_milestones.items():
+                    if milestone in ll:
+                        self._set_progress(pct)
+                        break
+
+                # ── Progreso flash (porcentaje explícito en la salida) ──
+                m = re.search(r'(\d{1,3})\s*%', line)
+                if m:
+                    pct = min(int(m.group(1)), 100)
+                    self._set_progress(pct)
+
             proc.wait()
             return proc.returncode == 0, proc.returncode
         except FileNotFoundError as e:
@@ -886,7 +1096,9 @@ class FlasherApp(tk.Tk):
         self._clear_log()
         self._set_busy(True)
         def run():
-            self._do_compile(force=True)
+            self._start_progress("indeterminate")
+            ok, _ = self._do_compile(force=True)
+            self._stop_progress(ok)
             self._set_busy(False)
         threading.Thread(target=run, daemon=True).start()
 
@@ -901,8 +1113,10 @@ class FlasherApp(tk.Tk):
         self._set_busy(True)
 
         def run():
+            self._start_progress("indeterminate")
             ok, bin_path = self._do_compile()
             if not ok:
+                self._stop_progress(False)
                 self._set_busy(False)
                 return
 
@@ -914,11 +1128,13 @@ class FlasherApp(tk.Tk):
             self._log_line("      2. Pulsa y suelta EN/RST", "#f0a000")
             self._log_line("      3. Suelta GPIO0\n", "#f0a000")
             self._set_status(f"Flasheando por USB en {port}...")
+            self._start_progress("determinate")
 
             cmd = [self._arduino_cli, "upload",
                    "--fqbn", FQBN, "--port", port,
                    "--input-dir", BUILD_DIR, SKETCH_DIR]
             ok, _ = self._run_cmd(cmd)
+            self._stop_progress(ok)
             if ok:
                 self._log_line("\n✓  Flash USB completado.\n", "#4ec9b0")
                 self._set_status("Flash USB completado")
@@ -943,8 +1159,10 @@ class FlasherApp(tk.Tk):
         self._set_busy(True)
 
         def run():
+            self._start_progress("indeterminate")
             ok, bin_path = self._do_compile()
             if not ok:
+                self._stop_progress(False)
                 self._set_busy(False)
                 return
 
@@ -952,14 +1170,14 @@ class FlasherApp(tk.Tk):
             self._log_line(f"  FLASH OTA — {ip}:3232", "#dcdcaa")
             self._log_line(f"{'─'*60}\n", "#444")
             self._set_status(f"Flasheando OTA a {ip}...")
+            self._start_progress("determinate")
 
-            # Usar python.exe (con consola) en vez de pythonw.exe para evitar
-            # WinError 10053 (firewall Windows corta conexiones de pythonw)
             py_exe = sys.executable.replace("pythonw.exe", "python.exe")
             cmd = ([py_exe, self._espota] if self._espota.endswith(".py")
                    else [self._espota])
             cmd += ["-i", ip, "-p", "3232", "-f", bin_path]
             ok, _ = self._run_cmd(cmd)
+            self._stop_progress(ok)
             if ok:
                 self._log_line("\n✓  Flash OTA completado.\n", "#4ec9b0")
                 self._set_status("Flash OTA completado")
