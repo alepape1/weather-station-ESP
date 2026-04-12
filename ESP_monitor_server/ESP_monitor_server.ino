@@ -3,6 +3,14 @@
 // Sensores: MCP9808, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
+// ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
+#define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
+#define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
+
+#ifndef DEVICE_PROFILE
+  #define DEVICE_PROFILE PROFILE_METEO
+#endif
+
 // ── Detección de plataforma ───────────────────────────────────────────────────
 #ifdef ESP8266
   #include <ESP8266WiFi.h>
@@ -79,14 +87,7 @@
   #include "provisioning.h"
 #endif
 
-// ── Perfiles de dispositivo (definir DEVICE_PROFILE en secrets.h) ─────────────
-#define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
-#define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
-
-#ifndef DEVICE_PROFILE
-  #define DEVICE_PROFILE PROFILE_METEO
-#endif
-
+// ── Perfiles de dispositivo (ver definiciones al inicio del archivo) ───────────
 #if DEVICE_PROFILE == PROFILE_IRRIGATION
   #define RELAY_COUNT 4
   #ifndef RELAY_PIN_1
