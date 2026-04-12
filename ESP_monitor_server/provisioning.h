@@ -25,6 +25,13 @@ char prov_ssid[64]       = "";
 char prov_password[64]   = "";
 char prov_mqtt_token[72] = "";  // token pre-flasheado en fábrica por Flash Tool
 
+// Callback opcional para mostrar la pantalla AP en dispositivos con TFT.
+// El .ino registra la función tras inicializar la pantalla.
+static void (*_prov_ap_display_fn)(const char* ap_ssid, const char* serial) = nullptr;
+inline void provisioning_register_ap_display(void (*fn)(const char*, const char*)) {
+  _prov_ap_display_fn = fn;
+}
+
 #define FACTORY_RESET_PIN 0   // GPIO0 — botón BOOT en casi todos los ESP32
 
 // ── Serial del dispositivo ────────────────────────────────────────────────────
@@ -273,6 +280,11 @@ void provisioning_start_ap() {
   Serial.printf("[PROV] %s — AP: %s\n",
                 reconfigure ? "Reconectando (WiFi fallido)" : "Sin credenciales",
                 ap_ssid);
+  Serial.printf("[PROV] Conecta tu movil a: %s  |  Pass: aquantia1\n", ap_ssid);
+  Serial.println("[PROV] Abre: http://192.168.4.1");
+
+  // Notificar al TFT (si hay display registrado) que estamos en modo AP
+  if (_prov_ap_display_fn) _prov_ap_display_fn(ap_ssid, device_serial_get());
 
   // WIFI_AP_STA permite escanear redes mientras el AP está activo
   WiFi.mode(WIFI_AP_STA);

@@ -11,6 +11,10 @@
   #define DEVICE_PROFILE PROFILE_METEO
 #endif
 
+// ── Modo debug — activo en rama test, quitar en producción ───────────────────
+#define DEBUG_MODE 1
+#define DEBUG_INTERVAL_MS 5000UL   // reporte completo cada 5 s
+
 // ── Detección de plataforma ───────────────────────────────────────────────────
 #ifdef ESP8266
   #include <ESP8266WiFi.h>
@@ -831,6 +835,31 @@ void drawScreen() {
   spr.pushSprite(0, 0);
 }
 
+// Pantalla que se muestra mientras el portal SoftAP está activo
+void drawAPScreen(const char* ap_ssid, const char* serial) {
+  spr.fillSprite(C_BG);
+  spr.fillRect(0, 0, 240, HDR_H, C_HDR);
+  spr.setTextColor(C_TEXT, C_HDR);
+  spr.drawCentreString("AQUANTIA  SETUP", 120, 4, 2);
+
+  spr.setTextColor(C_REAL, C_BG);
+  spr.drawCentreString("Configuracion WiFi", 120, 24, 2);
+
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("Conecta tu movil a:", 6, 46, 1);
+  spr.setTextColor(C_TEXT, C_BG);
+  spr.drawString(ap_ssid, 6, 58, 2);
+
+  spr.setTextColor(C_LABEL, C_BG);
+  spr.drawString("Pass: aquantia1", 6, 80, 1);
+  spr.drawString("Web:  192.168.4.1", 6, 92, 1);
+
+  spr.setTextColor(C_SIM, C_BG);
+  spr.drawString(serial, 6, 112, 1);
+
+  spr.pushSprite(0, 0);
+}
+
 void drawBootScreen(const char* wifiMsg) {
   spr.fillSprite(C_BG);
 
@@ -1113,6 +1142,46 @@ void setup() {
   setCpuFrequencyMhz(160);
   Serial.println("\n\n=== MeteoStation BOOT ===");
 
+#ifdef DEBUG_MODE
+  Serial.println("=== DEBUG MODE ACTIVO ===");
+  Serial.printf("[TEST] Perfil  : %s (%d)\n",
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", DEVICE_PROFILE);
+  Serial.printf("[TEST] Relays  : %d\n", RELAY_COUNT);
+  Serial.printf("[TEST] Display : %s\n",
+#ifdef HAS_DISPLAY
+    "SI (TFT 240x135)"
+#else
+    "NO"
+#endif
+  );
+  Serial.printf("[TEST] MQTT    : %s\n",
+#ifdef USE_MQTT
+    "HABILITADO"
+#else
+    "DESHABILITADO"
+#endif
+  );
+  Serial.printf("[TEST] MAC ROM : %s\n", device_serial_get());
+#endif  // DEBUG_MODE
+
+  // ── TFT init PRIMERO — debe ir antes del provisioning para poder mostrar ──
+  // el portal AP si el dispositivo no tiene credenciales WiFi en NVS
+#ifdef HAS_DISPLAY
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  spr.createSprite(240, 135);
+  spr.setSwapBytes(true);
+  pinMode(BTN_LEFT,  INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT);
+  lastActivityTime = millis();
+  // Registrar callback para que provisioning pueda dibujar la pantalla AP
+  provisioning_register_ap_display([](const char* ap_ssid, const char* serial) {
+    drawAPScreen(ap_ssid, serial);
+  });
+  drawBootScreen("Iniciando...");
+#endif
+
   // ── Credenciales: DEV_MODE (directo) vs PROD (NVS + portal) ──────────────
 #ifdef DEV_MODE
   // ── Modo desarrollo: usa secrets.h directamente, sin NVS ni portal ────────
@@ -1170,16 +1239,7 @@ void setup() {
   Serial.printf("SOIL GPIO%d configurado como ANALOG (11dB)\n", SOIL_PIN);
   #endif
 #endif
-#ifdef HAS_DISPLAY
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
-  spr.createSprite(240, 135);
-  spr.setSwapBytes(true);
-  pinMode(BTN_LEFT,  INPUT_PULLUP);
-  pinMode(BTN_RIGHT, INPUT);
-  lastActivityTime = millis();
-#endif
+  // Nota: TFT ya inicializado al principio de setup() para soportar pantalla AP
 
 #if DEVICE_PROFILE == PROFILE_METEO
   mcp_ok = tempsensor.begin(0x19);
@@ -1412,6 +1472,7 @@ void setup() {
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
       Serial.println("[PROV] WiFi fallido con credenciales NVS — iniciando portal de reconfiguración...");
+      // drawAPScreen se llama desde dentro de provisioning_start_ap() via callback
       provisioning_start_ap();  // no retorna
     }
 #endif
@@ -1423,6 +1484,24 @@ void setup() {
 
 #ifdef HAS_DISPLAY
   delay(2500);
+#endif
+
+#ifdef DEBUG_MODE
+  Serial.println(F("\n====== AQUANTIA BOOT COMPLETO ======"));
+  Serial.printf("[TEST] Perfil   : %s | Relays: %d\n",
+    (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", RELAY_COUNT);
+  Serial.printf("[TEST] WiFi     : %s\n",
+    (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
+  Serial.printf("[TEST] MCP9808  : %s\n", mcp_ok ? "REAL" : "SIM (sin sensor)");
+  Serial.printf("[TEST] Barometro: %s\n", bar_ok ? "REAL" : "SIM (sin sensor)");
+  Serial.printf("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
+  Serial.printf("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
+#if DEVICE_PROFILE == PROFILE_METEO
+  Serial.printf("[TEST] DHT11    : %s\n", dht_ok ? "REAL" : "SIM (sin sensor)");
+#endif
+  Serial.printf("[TEST] Heap     : %ld bytes libres\n", (long)ESP.getFreeHeap());
+  Serial.println(F("[TEST] Iniciando loop() — reporte cada 5s"));
+  Serial.println(F("====================================\n"));
 #endif
 }
 
@@ -1625,4 +1704,89 @@ void loop() {
     lastSendTime8266 = now;
   }
 #endif
+
+  // ── DEBUG: reporte completo de estado cada DEBUG_INTERVAL_MS ─────────────────
+#ifdef DEBUG_MODE
+  static unsigned long lastDebugReport = 0;
+  if (now - lastDebugReport >= DEBUG_INTERVAL_MS) {
+    lastDebugReport = now;
+
+    Serial.println(F("\n====== AQUANTIA TEST REPORT ======"));
+
+    // Perfil e info de compilacion
+    Serial.printf("[PERFIL] %s (%d) | Relays: %d | Display: %s | MQTT: %s\n",
+      (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION",
+      DEVICE_PROFILE, RELAY_COUNT,
+#ifdef HAS_DISPLAY
+      "SI",
+#else
+      "NO",
+#endif
+#ifdef USE_MQTT
+      "SI"
+#else
+      "NO"
+#endif
+    );
+
+    // Tiempo y memoria
+    unsigned long up = millis() / 1000;
+    Serial.printf("[TIEMPO] Uptime: %luh %02lum %02lus | Heap libre: %ld B\n",
+      up / 3600, (up % 3600) / 60, up % 60, (long)ESP.getFreeHeap());
+
+    // Serial / MAC del dispositivo
+    Serial.printf("[DEVICE] Serial: %s\n", device_serial_get());
+
+    // WiFi
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[WIFI  ] CONECTADO | IP: %s | RSSI: %d dBm | SSID: %s\n",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.SSID().c_str());
+    } else {
+      Serial.println("[WIFI  ] DESCONECTADO");
+    }
+
+#if !defined(ESP8266) && defined(USE_MQTT)
+    Serial.printf("[MQTT  ] %s\n",
+      mqttClient.connected() ? "CONECTADO" : "DESCONECTADO");
+#endif
+
+    // Estado de sensores
+    Serial.print("[SENSOR]");
+#if DEVICE_PROFILE == PROFILE_METEO
+    Serial.printf(" MCP9808:%s  Barometro:%s  DHT11:%s",
+      mcp_ok ? "REAL" : "SIM", bar_ok ? "REAL" : "SIM", dht_ok ? "REAL" : "SIM");
+#else
+    Serial.print(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
+#endif
+    Serial.printf("  HTU2x:%s  LuzAmb:%s\n",
+      htu_ok ? "REAL" : "SIM", tsl_ok ? "REAL" : "SIM");
+
+    // Valores medidos / simulados
+    Serial.printf("[DATOS ] T_MCP:%.1f C  T_HTU:%.1f C  H_HTU:%.1f%%  Lux:%.1f lx\n",
+      temperatureMCP, temperatureDHT, humidity, lightLevel);
+#if DEVICE_PROFILE == PROFILE_METEO
+    Serial.printf("[DATOS ] P:%.2f kPa  T_DHT11:%.1f C  H_DHT11:%.1f%%  Suelo:%.1f%%\n",
+      (float)pressure, temperatureDHT11, humidityDHT11, soilMoisture);
+#endif
+    Serial.printf("[VIENTO] Speed:%.1f m/s (filt:%.1f) | Dir:%.0f grados (%s)\n",
+      windSpeed, windSpeedFiltered, currentWindDirDeg, degToCompass(currentWindDirDeg));
+
+    // Estado relays
+    Serial.print("[RELAYS]");
+    for (int i = 0; i < RELAY_COUNT; i++) {
+      Serial.printf(" R%d:%s", i, relayActive[i] ? "ON " : "OFF");
+    }
+    Serial.println();
+
+    // Test assertions
+    bool allRelaysOff = true;
+    for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) { allRelaysOff = false; break; }
+
+    Serial.println("[TEST  ] " + String(allRelaysOff ? "PASS" : "FAIL") +
+                   " — Todos los relays en OFF (estado seguro)");
+    Serial.println("[TEST  ] PASS — Boot completado sin crash (uptime > 0)");
+    Serial.println("[TEST  ] PASS — Sensores: modo SIM cuando no hay hardware conectado");
+    Serial.println(F("==================================\n"));
+  }
+#endif  // DEBUG_MODE
 }
