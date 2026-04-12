@@ -1194,6 +1194,22 @@ void setup() {
   provisioning_load();  // carga ssid+password desde NVS si existen
 
   if (!provisioning_has_credentials()) {
+#ifdef HAS_DISPLAY
+    // Dibujar pantalla AP antes de entrar en el portal (que bloquea para siempre).
+    // Usamos device_serial_get() en vez de WiFi.macAddress() porque WiFi aún
+    // no está inicializado aquí y macAddress() puede devolver "00:00:00:00:00:00".
+    // Serial = "AQ-FCB467F37748" → SSID = "Aquantia-F37748" (últimos 6 hex del MAC)
+    {
+      const char* ser = device_serial_get();
+      char ap_ssid_buf[32];
+      if (strlen(ser) >= 15)
+        snprintf(ap_ssid_buf, sizeof(ap_ssid_buf), "Aquantia-%.6s", ser + 9);
+      else
+        strlcpy(ap_ssid_buf, "Aquantia-??????", sizeof(ap_ssid_buf));
+      Serial.printf("[TFT] Mostrando pantalla AP: %s\n", ap_ssid_buf);
+      drawAPScreen(ap_ssid_buf, ser);
+    }
+#endif
     provisioning_start_ap();  // bloquea hasta que el usuario configure
   }
 
