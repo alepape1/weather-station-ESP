@@ -61,7 +61,18 @@ static Preferences _prov_prefs;
  * Solo sobreescribe los buffers prov_* si NVS tiene valor no vacío.
  */
 void provisioning_load() {
-  _prov_prefs.begin("aquantia", /*readOnly=*/true);
+  Serial.println("[PROV] Leyendo NVS namespace 'aquantia'...");
+  bool ok = _prov_prefs.begin("aquantia", /*readOnly=*/true);
+  if (!ok) {
+    Serial.println("[PROV] NVS namespace 'aquantia' no encontrado en modo read-only.");
+    Serial.println("[PROV] Reintentando abrir NVS en modo read-write...");
+    ok = _prov_prefs.begin("aquantia", /*readOnly=*/false);
+    if (!ok) {
+      Serial.println("[PROV] No se pudo abrir NVS 'aquantia' en modo read-write.");
+      return;
+    }
+  }
+
   String s;
   s = _prov_prefs.getString("ssid", "");
   if (s.length() > 0) strlcpy(prov_ssid, s.c_str(), sizeof(prov_ssid));
@@ -69,7 +80,12 @@ void provisioning_load() {
   if (s.length() > 0) strlcpy(prov_password, s.c_str(), sizeof(prov_password));
   // Token pre-flasheado en fábrica — no se escribe desde el portal
   s = _prov_prefs.getString("mqtt_token", "");
-  if (s.length() > 0) strlcpy(prov_mqtt_token, s.c_str(), sizeof(prov_mqtt_token));
+  if (s.length() > 0) {
+    strlcpy(prov_mqtt_token, s.c_str(), sizeof(prov_mqtt_token));
+    Serial.printf("[PROV] mqtt_token cargado (%d bytes)\n", (int)strlen(prov_mqtt_token));
+  } else {
+    Serial.println("[PROV] mqtt_token no encontrado en NVS");
+  }
   _prov_prefs.end();
 }
 

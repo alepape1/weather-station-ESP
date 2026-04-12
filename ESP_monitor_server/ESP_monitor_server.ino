@@ -12,7 +12,7 @@
 #endif
 
 // ── Modo debug — activo en rama test, quitar en producción ───────────────────
-#define DEBUG_MODE 1
+//#define DEBUG_MODE 1
 #define DEBUG_INTERVAL_MS 5000UL   // reporte completo cada 5 s
 
 // ── Detección de plataforma ───────────────────────────────────────────────────

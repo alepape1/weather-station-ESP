@@ -402,8 +402,8 @@ def fp_save_registry(serial, mac, profile_label, ver_label):
         ])
 
 
-def fp_write_nvs(esptool, nvs_gen, port, serial_number, token):
-    """Genera la partición NVS y la flashea a 0x9000."""
+def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
+    """Genera la partición NVS y la flashea en el offset indicado."""
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "nvs.csv")
         bin_path = os.path.join(tmpdir, "nvs.bin")
@@ -440,9 +440,9 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token):
             raise RuntimeError("nvs_partition_gen no disponible. "
                                "Instala: pip install esp-idf-nvs-partition-gen")
 
-        # Flashear NVS a 0x9000
+        # Flashear NVS en el offset de la partición NVS (por defecto 0x9000)
         cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
-        cmd += ["--port", port, "write_flash", "0x9000", bin_path]
+        cmd += ["--port", port, "write_flash", hex(offset), bin_path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             raise RuntimeError(f"Error flash NVS: {r.stderr.strip()}")
@@ -1345,10 +1345,22 @@ class FlasherApp(tk.Tk):
                     self._log_line("   NVS se escribirá igualmente.", "#888")
                     self._log_line("   Registra en backend cuando el servidor esté online.", "#888")
 
-                # 5. Escribir NVS
-                self._log_line(f"\n● Escribiendo NVS en {port} (0x9000)...", "#569cd6")
+                # 5. Leer offset de la partición NVS antes de escribir
+                nvs_offset = 0x9000
+                partitions = read_partition_table(self._esptool, port)
+                if partitions:
+                    nvs_part = find_nvs_partition(partitions)
+                    if nvs_part:
+                        nvs_offset = nvs_part["offset"]
+                        self._log_line(f"  Partición NVS encontrada: nombre={nvs_part['name']} offset=0x{nvs_offset:X}", "#4ec9b0")
+                    else:
+                        self._log_line("  No se encontró partición NVS; usando 0x9000 por defecto", "#f0a000")
+                else:
+                    self._log_line("  No se pudo leer la tabla de particiones; usando 0x9000 por defecto", "#f0a000")
+
+                self._log_line(f"\n● Escribiendo NVS en {port} (offset=0x{nvs_offset:X})...", "#569cd6")
                 try:
-                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token)
+                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token, nvs_offset)
                     self._log_line("✓  NVS escrito correctamente.", "#4ec9b0")
                 except Exception as e:
                     self._log_line(f"✗  Error NVS: {e}", "#f44747")
