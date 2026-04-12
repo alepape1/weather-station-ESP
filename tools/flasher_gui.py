@@ -203,6 +203,77 @@ def find_nvs_gen():
     return None
 
 
+# ── Partition table helpers ───────────────────────────────────────────────────
+
+# La tabla de particiones siempre está en 0x8000 en todos los ESP32/S2/S3/C3/C6.
+_PARTITION_TABLE_OFFSET = 0x8000
+_PARTITION_TABLE_SIZE   = 0xC00    # 3 KB: más que suficiente para cualquier tabla
+_PARTITION_ENTRY_MAGIC  = b'\xAA\x50'
+_PARTITION_ENTRY_SIZE   = 32
+
+# type / subtype para NVS
+_PART_TYPE_DATA    = 0x01
+_PART_SUBTYPE_NVS  = 0x02
+
+
+def read_partition_table(esptool, port):
+    """
+    Lee la tabla de particiones del chip conectado al puerto serie.
+    Devuelve lista de dicts {name, type, subtype, offset, size}
+    o None si la lectura o el parseo fallan.
+    La tabla está en 0x8000 para todos los ESP32 (incluidos S2, S3, C3, C6).
+    """
+    import struct, tempfile
+
+    cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
+    os.close(tmp_fd)
+    try:
+        cmd += ["--port", port, "read_flash",
+                hex(_PARTITION_TABLE_OFFSET),
+                hex(_PARTITION_TABLE_SIZE),
+                tmp_path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            return None
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    partitions = []
+    for i in range(0, len(data) - _PARTITION_ENTRY_SIZE + 1, _PARTITION_ENTRY_SIZE):
+        entry = data[i:i + _PARTITION_ENTRY_SIZE]
+        if entry[:2] != _PARTITION_ENTRY_MAGIC:
+            continue  # fin de tabla o padding
+        p_type    = entry[2]
+        p_subtype = entry[3]
+        p_offset  = struct.unpack_from("<I", entry, 4)[0]
+        p_size    = struct.unpack_from("<I", entry, 8)[0]
+        p_name    = entry[12:28].rstrip(b"\x00").decode("ascii", errors="replace")
+        partitions.append({
+            "name":    p_name,
+            "type":    p_type,
+            "subtype": p_subtype,
+            "offset":  p_offset,
+            "size":    p_size,
+        })
+    return partitions or None
+
+
+def find_nvs_partition(partitions):
+    """Devuelve la primera partición NVS (type=data=0x01, subtype=nvs=0x02) o None."""
+    for p in partitions:
+        if p["type"] == _PART_TYPE_DATA and p["subtype"] == _PART_SUBTYPE_NVS:
+            return p
+    return None
+
+
 # ── Factory provision helpers ─────────────────────────────────────────────────
 
 def fp_read_mac(esptool, port):
@@ -1313,9 +1384,11 @@ class FlasherApp(tk.Tk):
     # ── Borrar NVS ────────────────────────────────────────────────────────────
 
     def _erase_nvs(self):
-        """Borra la partición NVS del ESP32 (0x9000, 0x6000 bytes).
-        Elimina credenciales WiFi, token MQTT y serial almacenados.
-        El dispositivo arrancará en modo SoftAP la próxima vez.
+        """
+        Flujo en dos fases:
+        1. Hilo background: lee la tabla de particiones real del chip.
+        2. Hilo principal:  muestra confirmación con offset/size reales,
+                            luego lanza el borrado si el usuario acepta.
         """
         if self._busy:
             return
@@ -1330,9 +1403,79 @@ class FlasherApp(tk.Tk):
                                  "Instala Arduino IDE 2.x o pip install esptool.")
             return
 
+        self._clear_log()
+        self._set_busy(True)
+
+        def discover():
+            """Fase 1 — lee la tabla de particiones (background)."""
+            self._start_progress("indeterminate")
+            self._log_line("─" * 60, "#444")
+            self._log_line("  BORRAR NVS — leyendo tabla de particiones...", "#dcdcaa")
+            self._log_line(f"  Puerto: {port}", "#888")
+            self._log_line("─" * 60, "#444")
+            self._set_status("Leyendo tabla de particiones del chip...")
+
+            partitions = read_partition_table(self._esptool, port)
+            nvs_part   = find_nvs_partition(partitions) if partitions else None
+
+            # Volver al hilo principal para el diálogo de confirmación
+            self.after(0, lambda: self._erase_nvs_confirm(port, partitions, nvs_part))
+
+        threading.Thread(target=discover, daemon=True).start()
+
+    def _erase_nvs_confirm(self, port, partitions, nvs_part):
+        """Fase 2 — muestra confirmación con datos reales (hilo principal)."""
+        self._stop_progress(success=True)
+
+        if partitions is None:
+            # No se pudo leer la tabla: advertir y ofrecer cancelar
+            msg = (
+                "No se pudo leer la tabla de particiones del chip.\n\n"
+                "Posibles causas:\n"
+                "  • El dispositivo no está en modo bootloader\n"
+                "  • Puerto COM incorrecto\n\n"
+                "Revisa la conexión y vuelve a intentarlo."
+            )
+            messagebox.showerror("Error leyendo particiones", msg)
+            self._set_status("Error leyendo tabla de particiones")
+            self._set_busy(False)
+            return
+
+        # Mostrar todas las particiones encontradas en el log
+        self._log_line("\n● Tabla de particiones del chip:", "#569cd6")
+        for p in partitions:
+            marker = " ◀ NVS" if (p["type"] == _PART_TYPE_DATA and
+                                   p["subtype"] == _PART_SUBTYPE_NVS) else ""
+            self._log_line(
+                f"   {p['name']:<16}  type=0x{p['type']:02X}  "
+                f"sub=0x{p['subtype']:02X}  "
+                f"offset=0x{p['offset']:05X}  "
+                f"size=0x{p['size']:05X}{marker}",
+                "#dcdcaa" if marker else "#888"
+            )
+
+        if nvs_part is None:
+            messagebox.showerror(
+                "NVS no encontrada",
+                "La tabla de particiones del chip no contiene una partición NVS\n"
+                "(type=0x01, subtype=0x02).\n\n"
+                "Comprueba el log para ver las particiones detectadas."
+            )
+            self._set_status("Partición NVS no encontrada en este chip")
+            self._set_busy(False)
+            return
+
+        offset_hex = f"0x{nvs_part['offset']:05X}"
+        size_hex   = f"0x{nvs_part['size']:05X}"
+        size_kb    = nvs_part['size'] // 1024
+
         confirmed = messagebox.askyesno(
             "Confirmar borrado NVS",
-            "¿Borrar la partición NVS del dispositivo?\n\n"
+            f"¿Borrar la partición NVS del dispositivo?\n\n"
+            f"Partición detectada en el chip:\n"
+            f"  Nombre:  {nvs_part['name']}\n"
+            f"  Offset:  {offset_hex}\n"
+            f"  Tamaño:  {size_hex}  ({size_kb} KB)\n\n"
             "Esto eliminará:\n"
             "  • Credenciales WiFi configuradas\n"
             "  • Token MQTT de fábrica\n"
@@ -1342,41 +1485,47 @@ class FlasherApp(tk.Tk):
             icon="warning",
         )
         if not confirmed:
+            self._log_line("\n  Borrado cancelado por el usuario.", "#888")
+            self._set_status("Borrado NVS cancelado")
+            self._set_busy(False)
             return
 
-        self._clear_log()
-        self._set_busy(True)
+        # Fase 3 — borrado real (background)
+        threading.Thread(
+            target=self._erase_nvs_run,
+            args=(port, nvs_part["offset"], nvs_part["size"]),
+            daemon=True,
+        ).start()
 
-        def run():
-            try:
-                self._start_progress("indeterminate")
-                self._log_line("─" * 60, "#444")
-                self._log_line("  BORRAR NVS  (0x9000 · 0x6000 bytes)", "#dcdcaa")
-                self._log_line(f"  Puerto: {port}", "#888")
-                self._log_line("─" * 60, "#444")
-                self._set_status("Borrando NVS...")
+    def _erase_nvs_run(self, port, offset, size):
+        """Fase 3 — ejecuta esptool erase_region con los valores reales del chip."""
+        try:
+            self._start_progress("indeterminate")
+            self._log_line(
+                f"\n● Borrando NVS: offset={hex(offset)}  size={hex(size)}...",
+                "#569cd6"
+            )
+            self._set_status("Borrando NVS...")
 
-                cmd = ([sys.executable, self._esptool]
-                       if self._esptool.endswith(".py") else [self._esptool])
-                cmd += ["--port", port, "erase_region", "0x9000", "0x6000"]
+            cmd = ([sys.executable, self._esptool]
+                   if self._esptool.endswith(".py") else [self._esptool])
+            cmd += ["--port", port, "erase_region", hex(offset), hex(size)]
 
-                ok, _ = self._run_cmd(cmd)
-                self._stop_progress(ok)
-                if ok:
-                    self._log_line("\n✓  NVS borrada correctamente.", "#4ec9b0")
-                    self._log_line("   El dispositivo arrancará en modo SoftAP la próxima vez.", "#888")
-                    self._set_status("NVS borrada — re-flashea o configura por SoftAP")
-                else:
-                    self._log_line("\n✗  Error al borrar NVS.", "#f44747")
-                    self._log_line("   Asegúrate de que el dispositivo está en modo bootloader.", "#888")
-                    self._set_status("Error al borrar NVS")
-            except Exception as e:
-                self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
+            ok, _ = self._run_cmd(cmd)
+            self._stop_progress(ok)
+            if ok:
+                self._log_line("\n✓  NVS borrada correctamente.", "#4ec9b0")
+                self._log_line("   El dispositivo arrancará en modo SoftAP la próxima vez.", "#888")
+                self._set_status("NVS borrada — configura WiFi por SoftAP o re-provisiona")
+            else:
+                self._log_line("\n✗  Error al borrar NVS.", "#f44747")
+                self._log_line("   Asegúrate de que el dispositivo está en modo bootloader.", "#888")
                 self._set_status("Error al borrar NVS")
-            finally:
-                self._set_busy(False)
-
-        threading.Thread(target=run, daemon=True).start()
+        except Exception as e:
+            self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")
+            self._set_status("Error al borrar NVS")
+        finally:
+            self._set_busy(False)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
