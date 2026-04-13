@@ -1025,23 +1025,27 @@ void networkTask(void* pvParameters) {
         xSemaphoreGive(dataMutex);
       }
 
+      // Redondeo para reducir tamaño del payload MQTT
+      auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
+      auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
+
       StaticJsonDocument<512> doc;
-      doc["temperature"]           = snap_tempMCP;
-      doc["pressure"]              = snap_pressure;
-      doc["temperature_barometer"] = snap_tempDHT;
-      doc["humidity"]              = snap_humidity;
-      doc["windSpeed"]             = snap_windSpeed;
-      doc["windDirection"]         = snap_windDir;
-      doc["windSpeedFiltered"]     = snap_windSpeedFilt;
-      doc["windDirectionFiltered"] = snap_avgWindDir;
-      doc["light"]                 = snap_light;
-      doc["dht_temperature"]       = snap_tempDHT11;
-      doc["dht_humidity"]          = snap_humDHT11;
+      doc["temperature"]           = r2(snap_tempMCP);
+      doc["pressure"]              = r2(snap_pressure);
+      doc["temperature_barometer"] = r2(snap_tempDHT);
+      doc["humidity"]              = r2(snap_humidity);
+      doc["windSpeed"]             = r2(snap_windSpeed);
+      doc["windDirection"]         = r1(snap_windDir);
+      doc["windSpeedFiltered"]     = r2(snap_windSpeedFilt);
+      doc["windDirectionFiltered"] = r1(snap_avgWindDir);
+      doc["light"]                 = r1(snap_light);
+      doc["dht_temperature"]       = r1(snap_tempDHT11);
+      doc["dht_humidity"]          = r1(snap_humDHT11);
       doc["rssi"]                  = snap_rssi;
       doc["free_heap"]             = snap_heap;
       doc["uptime_s"]              = snap_uptime;
       doc["relay_active"]          = snap_relayMask;
-      doc["soil_moisture"]         = snap_soil;
+      doc["soil_moisture"]         = r1(snap_soil);
       doc["mac_address"]           = WiFi.macAddress();
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
       // El backend lo usa como timestamp real de la medición en lugar de NOW().
