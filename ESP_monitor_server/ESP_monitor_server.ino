@@ -3,6 +3,12 @@
 // Sensores: MCP9808, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
+// ── Versión del firmware ───────────────────────────────────────────────────────
+// Incrementar según SemVer al crear un release. El backend almacena este valor
+// en device_info.firmware_version para mostrar en el dashboard y detectar
+// dispositivos desactualizados (comparado con app_settings.min_firmware_version).
+#define FIRMWARE_VERSION "0.1.0-beta.1"
+
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
 #define PROFILE_IRRIGATION  2   // ECU irrigación   — 4 relays (GPIOs RELAY_PIN_1..4)
@@ -578,9 +584,10 @@ void postDeviceInfo() {
   doc["cpu_freq_mhz"]  = ESP.getCpuFreqMHz();
   doc["flash_size_mb"] = ESP.getFlashChipSize() / (1024 * 1024);
   doc["sdk_version"]   = ESP.getSdkVersion();
-  doc["mac_address"]   = WiFi.macAddress();
-  doc["ip_address"]    = WiFi.localIP().toString();
-  doc["relay_count"]   = RELAY_COUNT;
+  doc["mac_address"]      = WiFi.macAddress();
+  doc["ip_address"]       = WiFi.localIP().toString();
+  doc["relay_count"]      = RELAY_COUNT;
+  doc["firmware_version"] = FIRMWARE_VERSION;
 
   String json;
   serializeJson(doc, json);
@@ -936,8 +943,9 @@ void mqttPublishRegister() {
   doc["chip_revision"] = (int)ESP.getChipRevision();
   doc["cpu_freq_mhz"]  = (int)ESP.getCpuFreqMHz();
   doc["flash_size_mb"] = (int)(ESP.getFlashChipSize() / 1048576);
-  doc["sdk_version"]   = ESP.getSdkVersion();
-  doc["relay_count"]   = RELAY_COUNT;
+  doc["sdk_version"]      = ESP.getSdkVersion();
+  doc["relay_count"]      = RELAY_COUNT;
+  doc["firmware_version"] = FIRMWARE_VERSION;
   char topic[64], buf[256];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
   serializeJson(doc, buf, sizeof(buf));
