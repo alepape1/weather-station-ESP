@@ -470,3 +470,85 @@ La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
 |----------|--------|
 | Presión en kPa en vez de hPa | Pendiente — cambiar `readPressure(KPA)` → `readPressure(PA) / 100.0` |
 | DHT11 lecturas inestables ocasionalmente | Conocido — valorar reemplazar por DHT22 o SHT31 |
+
+---
+
+## Versionado y flujo de trabajo
+
+### Estructura de ramas
+
+```
+main              ← producción (solo merges de release/* o hotfix/*)
+develop           ← integración continua
+feature/*         ← nueva funcionalidad (sale de develop, merge a develop)
+release/vX.Y.Z    ← congelado para pruebas (sale de develop)
+hotfix/*          ← parche urgente sobre main
+```
+
+**Regla principal:** nunca se trabaja directamente en `main`. Todo cambio pasa por `develop` y, cuando llega a producción, lo hace a través de una rama `release/`.
+
+### Versionado semántico (SemVer)
+
+El firmware sigue `MAJOR.MINOR.PATCH[-prerelease]`:
+
+| Incremento | Cuándo |
+|------------|--------|
+| `PATCH` | Corrección de bug sin cambio de API/protocolo |
+| `MINOR` | Nueva funcionalidad compatible con backend anterior |
+| `MAJOR` | Cambio de protocolo MQTT o HTTP incompatible |
+
+Ejemplos de ciclo: `v0.1.0-beta.1` → `v0.1.0-rc.1` → `v0.1.0` → `v0.1.1` → `v0.2.0`
+
+### Cómo actualizar la versión del firmware
+
+La versión se define en una sola línea al inicio de `ESP_monitor_server.ino`:
+
+```cpp
+#define FIRMWARE_VERSION "0.1.0-beta.1"
+```
+
+Este valor se envía automáticamente al backend en dos momentos:
+- **Arranque**: mensaje MQTT `aquantia/<finca_id>/register` → campo `firmware_version`
+- **Registro HTTP**: POST `/api/device_info` → campo `firmware_version`
+
+El backend lo almacena en `device_info.firmware_version` y lo muestra como badge en el dashboard.
+
+### Proceso de release
+
+```bash
+# 1. Crear rama de release desde develop
+git checkout develop && git pull
+git checkout -b release/v0.2.0
+
+# 2. Actualizar FIRMWARE_VERSION en el .ino
+#    Editar: #define FIRMWARE_VERSION "0.2.0-rc.1"
+
+# 3. Actualizar CHANGELOG.md con los cambios
+
+# 4. Commit de cierre de release
+git add ESP_monitor_server/ESP_monitor_server.ino CHANGELOG.md
+git commit -m "chore: bump firmware to v0.2.0-rc.1"
+
+# 5. Etiquetar
+git tag -a v0.2.0-rc.1 -m "Release candidate v0.2.0-rc.1"
+git push origin release/v0.2.0 --tags
+
+# 6. Tras validación, merge a main y develop
+git checkout main && git merge --no-ff release/v0.2.0
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin main --tags
+git checkout develop && git merge --no-ff release/v0.2.0
+git push origin develop
+```
+
+### Compatibilidad firmware ↔ backend
+
+Ambos repositorios se versionan de forma independiente pero coordinada.
+El backend mantiene en `app_settings` la clave `min_firmware_version` con la versión mínima aceptada. Cuando se introduce un cambio de protocolo incompatible, se incrementa `MAJOR` en ambos repos y se actualiza ese valor.
+
+| Firmware | Backend app_meteo | Estado |
+|----------|-------------------|--------|
+| `v0.1.x` | `v0.1.x` | Compatible |
+| `v0.2.0` | `v0.1.x` | Puede no funcionar — revisar CHANGELOG |
+
+Ver también: [CHANGELOG.md](CHANGELOG.md) y el [README del backend](../app_meteo/app_meteo/README.md).
