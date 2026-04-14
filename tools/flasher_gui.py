@@ -18,6 +18,7 @@ import tempfile
 import secrets as _secrets
 import csv
 import urllib.request
+from urllib.parse import urlparse
 import re
 import socket
 import time
@@ -58,7 +59,7 @@ ESPOTA_GLOB_PATTERNS = [
 
 FQBN = "esp32:esp32:esp32"
 
-BACKEND_URL  = "https://meteo.aquantialab.com"
+BACKEND_URL = "https://meteo.aquantialab.com"
 APP_BASE_URL = "https://meteo.aquantialab.com"   # URL base del QR de claim
 
 REGISTRY_FILE = os.path.join(SCRIPT_DIR, "devices_registry.csv")
@@ -86,6 +87,34 @@ NVS_GEN_GLOB_PATTERNS = [
 PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
     "IRRIGATION — 4 relays (sin pantalla)": "2",
+}
+
+
+def guess_local_ip():
+    """Intenta obtener la IP LAN del PC para usar el backend local."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return "192.168.1.100"
+
+
+LOCAL_LAN_IP = guess_local_ip()
+
+SERVER_PRESETS = {
+    "Producción": {
+        "backend_url": BACKEND_URL,
+        "app_base_url": APP_BASE_URL,
+        "mqtt_server": "meteo.aquantialab.com",
+        "mqtt_port": 8883,
+    },
+    "Local": {
+        "backend_url": "http://127.0.0.1:7000",
+        "app_base_url": f"http://{LOCAL_LAN_IP}:5173",
+        "mqtt_server": LOCAL_LAN_IP,
+        "mqtt_port": 1883,
+    },
 }
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
@@ -339,7 +368,7 @@ def fp_register_backend(mac, token_hash, serial_number, backend_url=BACKEND_URL)
         return json.loads(resp.read())
 
 
-def show_qr_window(serial, mac):
+def show_qr_window(serial, mac, app_base_url=APP_BASE_URL):
     """Abre una ventana con el QR del serial del dispositivo."""
     if not _QR_AVAILABLE:
         messagebox.showwarning(
@@ -348,12 +377,14 @@ def show_qr_window(serial, mac):
         )
         return
 
+    claim_url = f"{app_base_url.rstrip('/')}/claim?serial={serial}"
+
     win = tk.Toplevel()
     win.title(f"Etiqueta — {serial}")
     win.resizable(False, False)
     win.configure(bg="#1e1e1e")
 
-    img = qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}")
+    img = qrcode.make(claim_url)
     img = img.resize((220, 220))
     tk_img = ImageTk.PhotoImage(img)
 
@@ -374,14 +405,16 @@ def show_qr_window(serial, mac):
             filetypes=[("PNG", "*.png")],
         )
         if path:
-            qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(path)
+            qrcode.make(claim_url).save(path)
 
     ttk.Button(win, text="Guardar PNG", command=save_png).pack(pady=(0, 16))
 
 
-def fp_save_registry(serial, mac, profile_label, ver_label):
+def fp_save_registry(serial, mac, profile_label, ver_label,
+                     app_base_url=APP_BASE_URL):
     """Añade una fila al CSV de registro y guarda el PNG del QR en devices_qr/."""
     file_exists = os.path.isfile(REGISTRY_FILE)
+    claim_url = f"{app_base_url.rstrip('/')}/claim?serial={serial}"
     with open(REGISTRY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
@@ -391,7 +424,7 @@ def fp_save_registry(serial, mac, profile_label, ver_label):
             os.makedirs(REGISTRY_QR_DIR, exist_ok=True)
             qr_path = os.path.join(REGISTRY_QR_DIR, f"{serial}.png")
             if not os.path.isfile(qr_path):
-                qrcode.make(f"{APP_BASE_URL}/claim?serial={serial}").save(qr_path)
+                qrcode.make(claim_url).save(qr_path)
         writer.writerow([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             serial,
@@ -402,7 +435,8 @@ def fp_save_registry(serial, mac, profile_label, ver_label):
         ])
 
 
-def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
+def fp_write_nvs(esptool, nvs_gen, port, serial_number, token,
+                 offset=0x9000, size=0x5000):
     """Genera la partición NVS y la flashea en el offset indicado."""
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "nvs.csv")
@@ -421,7 +455,7 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
         ok = False
         if nvs_gen:
             r = subprocess.run(
-                [sys.executable, nvs_gen, "generate", csv_path, bin_path, "0x6000"],
+                [sys.executable, nvs_gen, "generate", csv_path, bin_path, hex(size)],
                 capture_output=True, text=True, timeout=30
             )
             ok = r.returncode == 0
@@ -431,7 +465,7 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token, offset=0x9000):
             # Sintaxis: generate <input> <output> <size>
             r = subprocess.run(
                 [sys.executable, "-m", "esp_idf_nvs_partition_gen",
-                 "generate", csv_path, bin_path, "0x6000"],
+                 "generate", csv_path, bin_path, hex(size)],
                 capture_output=True, text=True, timeout=30
             )
             ok = r.returncode == 0
@@ -726,15 +760,43 @@ class FlasherApp(tk.Tk):
         self._mode_lbl.pack(side="left", padx=8)
         self._update_mode_ui()
 
+        target_frame = tk.Frame(btn_frame)
+        target_frame.grid(row=1, column=0, columnspan=3, pady=(0, 6))
+        tk.Label(target_frame, text="Servidor:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._server_target_var = tk.StringVar(value="Producción")
+        self._server_hint_var = tk.StringVar(value="")
+        self._server_target_cb = ttk.Combobox(
+            target_frame,
+            textvariable=self._server_target_var,
+            values=list(SERVER_PRESETS.keys()),
+            state="readonly",
+            width=14,
+        )
+        self._server_target_cb.pack(side="left", padx=(4, 8))
+        self._server_target_cb.bind("<<ComboboxSelected>>", self._on_server_target_selected)
+
+        tk.Label(target_frame, text="Host/IP ESP:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._mqtt_server_var = tk.StringVar()
+        ttk.Entry(target_frame, textvariable=self._mqtt_server_var, width=18).pack(
+            side="left", padx=(4, 6))
+
+        tk.Label(target_frame, text="MQTT:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._mqtt_port_var = tk.StringVar()
+        ttk.Entry(target_frame, textvariable=self._mqtt_port_var, width=6).pack(
+            side="left", padx=(4, 0))
+
         self._btn_compile = ttk.Button(btn_frame, text="⚙  Compilar",
                                        width=16, command=self._compile)
-        self._btn_compile.grid(row=1, column=0, padx=6)
+        self._btn_compile.grid(row=2, column=0, padx=6)
         self._btn_serial  = ttk.Button(btn_frame, text="🔌  Flash USB",
                                        width=16, command=self._flash_serial)
-        self._btn_serial.grid(row=1, column=1, padx=6)
+        self._btn_serial.grid(row=2, column=1, padx=6)
         self._btn_ota     = ttk.Button(btn_frame, text="📡  Flash OTA",
                                        width=16, command=self._flash_ota)
-        self._btn_ota.grid(row=1, column=2, padx=6)
+        self._btn_ota.grid(row=2, column=2, padx=6)
 
         # ── Factory Provision ──
         sep = tk.Frame(self, height=1, bg="#dde3ea")
@@ -743,17 +805,32 @@ class FlasherApp(tk.Tk):
         fp_frame = tk.Frame(self)
         fp_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
-        tk.Label(fp_frame, text="Backend URL:",
+        fp_urls = tk.Frame(fp_frame)
+        fp_urls.pack(fill="x", pady=(0, 4))
+        tk.Label(fp_urls, text="Backend URL:",
                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        self._backend_var = tk.StringVar(value=BACKEND_URL)
-        ttk.Entry(fp_frame, textvariable=self._backend_var, width=28).pack(
+        self._backend_var = tk.StringVar()
+        ttk.Entry(fp_urls, textvariable=self._backend_var, width=28).pack(
             side="left", padx=(4, 10))
-        self._btn_factory = ttk.Button(fp_frame, text="🏷  Provisionar fábrica",
+        tk.Label(fp_urls, text="App / QR:",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._app_base_var = tk.StringVar()
+        ttk.Entry(fp_urls, textvariable=self._app_base_var, width=28).pack(
+            side="left", padx=(4, 0))
+
+        fp_actions = tk.Frame(fp_frame)
+        fp_actions.pack(fill="x")
+        self._btn_factory = ttk.Button(fp_actions, text="🏷  Provisionar fábrica",
                                        width=22, command=self._factory_provision)
         self._btn_factory.pack(side="left")
-        self._btn_erase_nvs = ttk.Button(fp_frame, text="🗑 Borrar NVS",
+        self._btn_erase_nvs = ttk.Button(fp_actions, text="🗑 Borrar NVS",
                                          width=14, command=self._erase_nvs)
         self._btn_erase_nvs.pack(side="left", padx=(8, 0))
+        tk.Label(fp_frame, textvariable=self._server_hint_var,
+                 fg="#666", font=("Segoe UI", 8, "italic")).pack(
+            anchor="w", pady=(4, 0))
+
+        self._apply_server_preset()
 
         # ── Estado ──
         self._status_var = tk.StringVar(value="Listo")
@@ -808,6 +885,108 @@ class FlasherApp(tk.Tk):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
+
+    def _on_server_target_selected(self, _event=None):
+        self._apply_server_preset()
+
+    def _apply_server_preset(self):
+        preset = SERVER_PRESETS.get(
+            self._server_target_var.get(),
+            SERVER_PRESETS["Producción"],
+        )
+        self._backend_var.set(preset["backend_url"])
+        self._app_base_var.set(preset["app_base_url"])
+        self._mqtt_server_var.set(preset["mqtt_server"])
+        self._mqtt_port_var.set(str(preset["mqtt_port"]))
+        if self._server_target_var.get() == "Local":
+            self._server_hint_var.set(
+                "Local: el ESP32 debe estar en la misma WiFi que este PC."
+            )
+        else:
+            self._server_hint_var.set(
+                "Producción: usará el broker y el claim de Aquantia en remoto."
+            )
+        self._sync_server_settings(log_change=False)
+        self._refresh_binary_status()
+
+    def _get_server_settings(self):
+        backend_url = self._backend_var.get().strip().rstrip("/")
+        app_base_url = self._app_base_var.get().strip().rstrip("/")
+        mqtt_server = self._mqtt_server_var.get().strip()
+        mqtt_port_raw = self._mqtt_port_var.get().strip()
+
+        if not backend_url:
+            raise ValueError("Falta la URL del backend.")
+        if not app_base_url:
+            raise ValueError("Falta la URL base de la app/QR.")
+        if not mqtt_server:
+            raise ValueError("Falta el host/IP del broker para el ESP32.")
+        try:
+            mqtt_port = int(mqtt_port_raw)
+        except ValueError as exc:
+            raise ValueError("El puerto MQTT debe ser numérico.") from exc
+
+        parsed = urlparse(
+            backend_url if "://" in backend_url else f"http://{backend_url}"
+        )
+        if not parsed.hostname:
+            raise ValueError("La URL del backend no es válida.")
+        server_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        return {
+            "backend_url": backend_url,
+            "app_base_url": app_base_url,
+            "mqtt_server": mqtt_server,
+            "mqtt_port": mqtt_port,
+            "server_ip": mqtt_server,
+            "server_port": server_port,
+        }
+
+    def _sync_server_settings(self, log_change=True):
+        try:
+            cfg = self._get_server_settings()
+        except ValueError as e:
+            if log_change:
+                self._log_line(f"⚠  Configuración de servidor inválida: {e}", "#f0a000")
+            return None
+
+        try:
+            with open(self._SECRETS_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            new_content = re.sub(
+                r'#define SERVER_IP\s+"[^"]+"',
+                f'#define SERVER_IP     "{cfg["server_ip"]}"',
+                content,
+            )
+            new_content = re.sub(
+                r"#define SERVER_PORT\s+\d+",
+                f"#define SERVER_PORT   {cfg['server_port']}",
+                new_content,
+            )
+            new_content = re.sub(
+                r'#define MQTT_SERVER\s+"[^"]+"',
+                f'#define MQTT_SERVER  "{cfg["mqtt_server"]}"',
+                new_content,
+            )
+            new_content = re.sub(
+                r"#define MQTT_PORT\s+\d+",
+                f"#define MQTT_PORT    {cfg['mqtt_port']}",
+                new_content,
+            )
+
+            if new_content != content:
+                with open(self._SECRETS_PATH, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                if log_change:
+                    self._log_line(
+                        f"✓  Servidor firmware → {cfg['mqtt_server']}:{cfg['mqtt_port']}",
+                        "#4ec9b0",
+                    )
+            return cfg
+        except Exception as e:
+            self._log_line(f"Error actualizando secrets.h: {e}", "#f44747")
+            return None
 
     def _refresh_versions(self):
         """git fetch + recarga el selector de versiones."""
@@ -1121,6 +1300,10 @@ class FlasherApp(tk.Tk):
         profile = PROFILES.get(self._profile_var.get(), "2")
         git_ref, ver_label = self._get_selected_ref()
         bin_path = os.path.join(BUILD_DIR, f"{SKETCH_NAME}.ino.bin")
+        server_cfg = self._sync_server_settings(log_change=True)
+        if not server_cfg:
+            self._set_status("Configuración de servidor inválida")
+            return False, None
 
         # ¿Podemos saltarnos la compilación?
         if not force:
@@ -1140,6 +1323,10 @@ class FlasherApp(tk.Tk):
 
         self._log_line(f"\n{'─'*60}", "#444")
         self._log_line(f"  COMPILANDO  perfil={profile}  versión={ver_label}", "#dcdcaa")
+        self._log_line(
+            f"  Servidor: {self._server_target_var.get()} → {server_cfg['mqtt_server']}:{server_cfg['mqtt_port']}",
+            "#888",
+        )
         self._log_line(f"{'─'*60}\n", "#444")
         self._set_status("Compilando...")
 
@@ -1295,6 +1482,14 @@ class FlasherApp(tk.Tk):
                                  "Instala Arduino IDE 2.x o pip install esptool.")
             return
 
+        server_cfg = self._sync_server_settings(log_change=False)
+        if not server_cfg:
+            messagebox.showerror(
+                "Configuración inválida",
+                "Revisa la URL del backend, la URL de la app y el host MQTT.",
+            )
+            return
+
         self._clear_log()
         self._set_busy(True)
 
@@ -1303,12 +1498,17 @@ class FlasherApp(tk.Tk):
 
         def run():
             try:
-                backend_url = self._backend_var.get().strip().rstrip("/")
+                backend_url = server_cfg["backend_url"]
+                app_base_url = server_cfg["app_base_url"]
 
                 self._log_line("─" * 60, "#444")
                 self._log_line("  FACTORY PROVISION", "#dcdcaa")
                 self._log_line(f"  Perfil:   {profile_label}", "#888")
                 self._log_line(f"  Firmware: {ver_label}", "#888")
+                self._log_line(
+                    f"  Servidor: {self._server_target_var.get()} → {server_cfg['mqtt_server']}:{server_cfg['mqtt_port']}",
+                    "#888",
+                )
                 self._log_line("─" * 60, "#444")
 
                 # 1. Leer MAC
@@ -1347,20 +1547,28 @@ class FlasherApp(tk.Tk):
 
                 # 5. Leer offset de la partición NVS antes de escribir
                 nvs_offset = 0x9000
+                nvs_size = 0x5000
                 partitions = read_partition_table(self._esptool, port)
                 if partitions:
                     nvs_part = find_nvs_partition(partitions)
                     if nvs_part:
                         nvs_offset = nvs_part["offset"]
-                        self._log_line(f"  Partición NVS encontrada: nombre={nvs_part['name']} offset=0x{nvs_offset:X}", "#4ec9b0")
+                        nvs_size = nvs_part["size"]
+                        self._log_line(
+                            f"  Partición NVS encontrada: nombre={nvs_part['name']} offset=0x{nvs_offset:X} size=0x{nvs_size:X}",
+                            "#4ec9b0"
+                        )
                     else:
-                        self._log_line("  No se encontró partición NVS; usando 0x9000 por defecto", "#f0a000")
+                        self._log_line("  No se encontró partición NVS; usando 0x9000 / 0x5000 por defecto", "#f0a000")
                 else:
-                    self._log_line("  No se pudo leer la tabla de particiones; usando 0x9000 por defecto", "#f0a000")
+                    self._log_line("  No se pudo leer la tabla de particiones; usando 0x9000 / 0x5000 por defecto", "#f0a000")
 
-                self._log_line(f"\n● Escribiendo NVS en {port} (offset=0x{nvs_offset:X})...", "#569cd6")
+                self._log_line(
+                    f"\n● Escribiendo NVS en {port} (offset=0x{nvs_offset:X}, size=0x{nvs_size:X})...",
+                    "#569cd6"
+                )
                 try:
-                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token, nvs_offset)
+                    fp_write_nvs(self._esptool, self._nvs_gen, port, serial, token, nvs_offset, nvs_size)
                     self._log_line("✓  NVS escrito correctamente.", "#4ec9b0")
                 except Exception as e:
                     self._log_line(f"✗  Error NVS: {e}", "#f44747")
@@ -1368,7 +1576,10 @@ class FlasherApp(tk.Tk):
 
                 # 6. Guardar en registro local CSV
                 try:
-                    fp_save_registry(serial, mac, profile_label, ver_label)
+                    fp_save_registry(
+                        serial, mac, profile_label, ver_label,
+                        app_base_url=app_base_url,
+                    )
                     self._log_line(f"✓  Registro guardado: {REGISTRY_FILE}", "#4ec9b0")
                 except Exception as e:
                     self._log_line(f"⚠  No se pudo guardar el registro: {e}", "#f0a000")
@@ -1383,7 +1594,10 @@ class FlasherApp(tk.Tk):
                 self._log_line(f"  Registro: {REGISTRY_FILE}", "#888")
                 self._log_line("═" * 60 + "\n", "#444")
                 self._set_status(f"Provisionado: {serial}")
-                self.after(100, lambda s=serial, m=mac: show_qr_window(s, m))
+                self.after(
+                    100,
+                    lambda s=serial, m=mac, a=app_base_url: show_qr_window(s, m, a),
+                )
 
             except Exception as e:
                 self._log_line(f"\n✗  Error inesperado: {e}", "#f44747")

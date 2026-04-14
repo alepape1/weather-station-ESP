@@ -74,15 +74,29 @@ void provisioning_load() {
   }
 
   String s;
-  s = _prov_prefs.getString("ssid", "");
-  if (s.length() > 0) strlcpy(prov_ssid, s.c_str(), sizeof(prov_ssid));
-  s = _prov_prefs.getString("password", "");
-  if (s.length() > 0) strlcpy(prov_password, s.c_str(), sizeof(prov_password));
+  if (_prov_prefs.isKey("ssid")) {
+    s = _prov_prefs.getString("ssid", "");
+    if (s.length() > 0) strlcpy(prov_ssid, s.c_str(), sizeof(prov_ssid));
+  } else {
+    Serial.println("[PROV] ssid no configurado aún");
+  }
+
+  if (_prov_prefs.isKey("password")) {
+    s = _prov_prefs.getString("password", "");
+    if (s.length() > 0) strlcpy(prov_password, s.c_str(), sizeof(prov_password));
+  } else {
+    Serial.println("[PROV] password no configurado aún");
+  }
+
   // Token pre-flasheado en fábrica — no se escribe desde el portal
-  s = _prov_prefs.getString("mqtt_token", "");
-  if (s.length() > 0) {
-    strlcpy(prov_mqtt_token, s.c_str(), sizeof(prov_mqtt_token));
-    Serial.printf("[PROV] mqtt_token cargado (%d bytes)\n", (int)strlen(prov_mqtt_token));
+  if (_prov_prefs.isKey("mqtt_token")) {
+    s = _prov_prefs.getString("mqtt_token", "");
+    if (s.length() > 0) {
+      strlcpy(prov_mqtt_token, s.c_str(), sizeof(prov_mqtt_token));
+      Serial.printf("[PROV] mqtt_token cargado (%d bytes)\n", (int)strlen(prov_mqtt_token));
+    } else {
+      Serial.println("[PROV] mqtt_token vacío en NVS");
+    }
   } else {
     Serial.println("[PROV] mqtt_token no encontrado en NVS");
   }

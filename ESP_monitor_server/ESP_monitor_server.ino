@@ -170,8 +170,9 @@ const int ledPin = 2;
 bool relayActive[RELAY_COUNT] = {};
 
 #ifdef USE_MQTT
+static WiFiClient       mqttTCPClient;
 static WiFiClientSecure mqttTLSClient;
-static PubSubClient     mqttClient(mqttTLSClient);
+static PubSubClient     mqttClient;
 #endif
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
@@ -966,7 +967,14 @@ void networkTask(void* pvParameters) {
   static unsigned long lastSendTime   = 0;
 
 #ifdef USE_MQTT
-  mqttTLSClient.setInsecure();  // DEBUG: skip cert verify — revert to setCACert() cuando funcione
+  if (mqtt_port == 8883) {
+    mqttTLSClient.setInsecure();
+    mqttClient.setClient(mqttTLSClient);
+    Serial.printf("[MQTT] Broker TLS: %s:%d\n", mqtt_server, mqtt_port);
+  } else {
+    mqttClient.setClient(mqttTCPClient);
+    Serial.printf("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
+  }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);

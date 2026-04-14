@@ -15,14 +15,57 @@ Salida:
 """
 
 import argparse
+import glob
 import hashlib
 import json
+import os
 import secrets
+import shutil
 import subprocess
 import sys
 import urllib.request
 
-BACKEND_URL = "http://127.0.0.1:7000"
+SERVER_PRESETS = {
+    "local": "http://127.0.0.1:7000",
+    "prod": "https://meteo.aquantialab.com",
+}
+
+BACKEND_URL = SERVER_PRESETS["local"]
+
+ESPTOOL_CANDIDATES = [
+    r"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\esptool\esptool.exe",
+    r"C:\Program Files (x86)\Arduino IDE\resources\app\lib\backend\resources\esptool\esptool.exe",
+    "esptool.exe",
+    "esptool",
+    "esptool.py",
+]
+
+NVS_GEN_GLOB_PATTERNS = [
+    os.path.expanduser(
+        r"~\AppData\Local\Arduino15\packages\esp32\tools\esp32-arduino-libs\*\tools\nvs_partition_gen.py"
+    ),
+    os.path.expanduser(
+        r"~\AppData\Local\Arduino15\packages\esp32\hardware\esp32\*\tools\nvs_partition_gen.py"
+    ),
+]
+
+
+def find_esptool() -> str | None:
+    for candidate in ESPTOOL_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def find_nvs_gen() -> str | None:
+    for pattern in NVS_GEN_GLOB_PATTERNS:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[-1]
+    return None
 
 
 def generate_token() -> str:
@@ -67,7 +110,7 @@ def register_in_backend(mac: str, token_hash: str, serial_number: str) -> dict:
 
 
 def flash_nvs(port: str, mac: str, serial_number: str, token: str,
-              finca_id: str = "") -> None:
+              finca_id: str = "", nvs_size: str = "0x5000") -> None:
     """Graba las credenciales en la NVS del ESP32 usando esptool + nvs_partition_gen.
 
     Requiere: pip install esptool
@@ -97,25 +140,30 @@ def flash_nvs(port: str, mac: str, serial_number: str, token: str,
         # Generar partición NVS binaria
         result = subprocess.run(
             [sys.executable, "-m", "esp_idf_nvs_partition_gen",
-             "--input", csv_path,
-             "--output", bin_path,
-             "--size", "0x6000"],
+             "generate", csv_path, bin_path, nvs_size],
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            # Intentar con nvs_partition_gen.py de IDF si está en PATH
-            result = subprocess.run(
-                ["nvs_partition_gen.py", "generate", csv_path, bin_path, "0x6000"],
-                capture_output=True, text=True
-            )
+            # Intentar con nvs_partition_gen.py del core ESP32 de Arduino
+            nvs_gen = find_nvs_gen()
+            if nvs_gen:
+                result = subprocess.run(
+                    [sys.executable, nvs_gen, "generate", csv_path, bin_path, nvs_size],
+                    capture_output=True, text=True
+                )
         if result.returncode != 0:
             print("AVISO: no se pudo generar NVS binario automáticamente.", file=sys.stderr)
             print("Graba manualmente las credenciales en el firmware (secrets.h).", file=sys.stderr)
             return
 
         # Flash NVS a dirección 0x9000 (partición nvs por defecto)
+        esptool = find_esptool()
+        if not esptool:
+            print("ERROR: no se encontró esptool. Instala Arduino IDE 2.x o pip install esptool", file=sys.stderr)
+            sys.exit(1)
+
         result = subprocess.run(
-            ["esptool.py", "--port", port, "write_flash", "0x9000", bin_path],
+            [esptool, "--port", port, "write_flash", "0x9000", bin_path],
             capture_output=True, text=True
         )
         if result.returncode == 0:
@@ -135,17 +183,19 @@ def main():
                         help="finca_id a asignar (opcional, normalmente lo elige el usuario)")
     parser.add_argument("--port", default="",
                         help="Puerto serie del ESP32 para flash NVS (ej: /dev/ttyUSB0)")
-    parser.add_argument("--backend-url", default=BACKEND_URL,
-                        help=f"URL del backend (defecto: {BACKEND_URL})")
+    parser.add_argument("--target", choices=("local", "prod"), default="local",
+                        help="Servidor destino: local o producción")
+    parser.add_argument("--backend-url", default="",
+                        help="URL del backend. Si se omite se usa la del target")
     args = parser.parse_args()
 
-    BACKEND_URL = args.backend_url.rstrip("/")
+    BACKEND_URL = (args.backend_url or SERVER_PRESETS[args.target]).rstrip("/")
 
     mac = args.mac.upper().replace("-", ":")
     if args.serial:
         serial_number = args.serial.upper()
     else:
-        serial_number = f"AQ-{mac.replace(":", "")}"
+        serial_number = f"AQ-{mac.replace(':', '')}"
 
     print(f"Aprovisionando dispositivo: MAC={mac}  SN={serial_number}")
 
