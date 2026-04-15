@@ -899,14 +899,20 @@ class FlasherApp(tk.Tk):
         self._mqtt_server_var.set(preset["mqtt_server"])
         self._mqtt_port_var.set(str(preset["mqtt_port"]))
         if self._server_target_var.get() == "Local":
-            self._server_hint_var.set(
-                "Local: el ESP32 debe estar en la misma WiFi que este PC."
-            )
+            if self._dev_mode_var.get():
+                self._server_hint_var.set(
+                    "Local: arranque directo con secrets.h; el ESP32 debe estar en la misma WiFi que este PC."
+                )
+            else:
+                self._server_hint_var.set(
+                    "Local: backend en este PC, pero el arranque sigue en PROD; pulsa DEV si quieres saltar el portal."
+                )
         else:
             self._server_hint_var.set(
                 "Producción: usará el broker y el claim de Aquantia en remoto."
             )
         self._sync_server_settings(log_change=False)
+        self._update_mode_ui()
         self._refresh_binary_status()
 
     def _get_server_settings(self):

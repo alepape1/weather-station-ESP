@@ -116,6 +116,9 @@
 
 #ifdef HAS_DISPLAY
   #include <TFT_eSPI.h>
+  #ifndef TFT_BL
+    #define TFT_BL 4   // LilyGo TTGO T-Display backlight
+  #endif
 #endif
 
 // ── Credenciales (definidas en secrets.h) ─────────────────────────────────────
@@ -139,10 +142,11 @@ const int ledPin = 2;
 #define LED_OFF HIGH
 
 // ── Intervalos ─────────────────────────────────────────────────────────────────
-#define WIND_MS       100
-#define SCREEN_MS    1000
-#define SEND_MS      2000
-#define RELAY_MS     2000   // Consulta estado relay cada 2s para respuesta casi inmediata
+#define WIND_MS          100
+#define SCREEN_MS       1000
+#define SEND_MS         2000
+#define RELAY_MS        2000   // Consulta estado relay cada 2s para respuesta casi inmediata
+#define PIPELINE_SYNC_MS 20000UL
 
 #ifdef HAS_DISPLAY
 #define DISPLAY_TIMEOUT_MS 60000UL  // Apagar pantalla tras 60s sin actividad
@@ -214,6 +218,13 @@ String pipelineScenario      = "normal";  // actualizado desde el servidor cada 
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
 
+static bool anyRelayActive() {
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    if (relayActive[i]) return true;
+  }
+  return false;
+}
+
 static float driftClamp(float v, float mn, float mx, float step) {
   float d = ((float)random(-100, 101) / 100.0f) * step;
   return constrain(v + d, mn, mx);
@@ -242,18 +253,19 @@ static float pipelineNoise(float t_s, int ch) {
 }
 
 void updatePipelineSimValues() {
+  const bool valveOpen = anyRelayActive();
   float t       = millis() / 1000.0f;
   float p_noise = pipelineNoise(t, 0) * PIPELINE_NOISE_P;
   float q_noise = pipelineNoise(t, 1) * PIPELINE_NOISE_Q;
 
   if (pipelineScenario == "burst") {
     sim_pipeline_pressure = max(0.0f, 0.25f + p_noise * 0.4f);
-    sim_pipeline_flow     = relayActive[0]
+    sim_pipeline_flow     = valveOpen
       ? max(0.0f, PIPELINE_NOMINAL_Q * 0.08f + fabsf(q_noise) * 0.3f)
       : 0.0f;
 
   } else if (pipelineScenario == "leak") {
-    if (relayActive) {
+    if (valveOpen) {
       sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P - 0.18f + p_noise);
       sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q - 0.45f + q_noise);
     } else {
@@ -262,7 +274,7 @@ void updatePipelineSimValues() {
     }
 
   } else {  // "normal"
-    if (relayActive) {
+    if (valveOpen) {
       sim_pipeline_pressure = max(0.0f, PIPELINE_DYNAMIC_P + p_noise);
       sim_pipeline_flow     = max(0.0f, PIPELINE_NOMINAL_Q + q_noise);
     } else {
@@ -573,6 +585,19 @@ void printHardwareInfo() {
   Serial.println("====================");
 }
 
+static bool serverUseTls() {
+  return server_port == 443 || server_port == 8443;
+}
+
+static String serverBaseUrl() {
+  String url = serverUseTls() ? "https://" : "http://";
+  url += String(server_ip);
+  if ((!serverUseTls() && server_port != 80) || (serverUseTls() && server_port != 443)) {
+    url += ":" + String(server_port);
+  }
+  return url;
+}
+
 void postDeviceInfo() {
   JsonDocument doc;
 #ifdef ESP8266
@@ -593,19 +618,22 @@ void postDeviceInfo() {
   String json;
   serializeJson(doc, json);
 
-  String url = "https://" + String(server_ip) + "/api/device_info";
+  String url = serverBaseUrl() + "/api/device_info";
+  HTTPClient http;
+  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
-  HTTPClient http;
-  http.setTimeout(10000);
   http.begin(wifiClient, url);
 #else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(10);
-  HTTPClient http;
-  http.setTimeout(10000);
-  http.begin(client, url);
+  if (serverUseTls()) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(10);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
 #endif
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json);
@@ -615,18 +643,21 @@ void postDeviceInfo() {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 String httpGet(const String& url, int timeoutMs = 10000) {
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
 #ifdef ESP8266
   WiFiClient wifiClient;
-  HTTPClient http;
-  http.setTimeout(timeoutMs);
   http.begin(wifiClient, url);
 #else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(timeoutMs / 1000);
-  HTTPClient http;
-  http.setTimeout(timeoutMs);
-  http.begin(client, url);
+  if (url.startsWith("https://")) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(timeoutMs / 1000);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
 #endif
   int code = http.GET();
   String body = "";
@@ -636,8 +667,19 @@ String httpGet(const String& url, int timeoutMs = 10000) {
   return body;
 }
 
+void syncPipelineScenario() {
+  String url = serverBaseUrl() + "/api/pipeline/scenario";
+  String nextScenario = httpGet(url, 2000);
+  if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
+    if (nextScenario != pipelineScenario) {
+      Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
+    }
+    pipelineScenario = nextScenario;
+  }
+}
+
 void checkRelayCommand() {
-  String url = "https://" + String(server_ip)
+  String url = serverBaseUrl()
                + "/api/relay/command?mac=" + WiFi.macAddress();
   String response = httpGet(url, 2000);
   if (response.length() == 0) return;
@@ -664,18 +706,21 @@ void checkRelayCommand() {
 }
 
 bool httpPost(const String& url, const String& body) {
+  HTTPClient http;
+  http.setTimeout(10000);
 #ifdef ESP8266
   WiFiClient wifiClient;
-  HTTPClient http;
-  http.setTimeout(10000);
   http.begin(wifiClient, url);
 #else
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(10);
-  HTTPClient http;
-  http.setTimeout(10000);
-  http.begin(client, url);
+  if (url.startsWith("https://")) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(10);
+    http.begin(client, url);
+  } else {
+    WiFiClient client;
+    http.begin(client, url);
+  }
 #endif
   http.addHeader("Content-Type", "text/plain");
   http.addHeader("X-Device-MAC", WiFi.macAddress());
@@ -922,14 +967,25 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 // Conectar al broker y suscribirse al topic de comandos
 bool mqttConnect() {
-  bool ok = mqttClient.connect("aquantia-device", mqtt_user, mqtt_pass);
+  char client_id[48];
+  String mac_no_colon = WiFi.macAddress();
+  mac_no_colon.replace(":", "");
+
+  if (mac_no_colon.length() >= 12) {
+    snprintf(client_id, sizeof(client_id), "aquantia-%s", mac_no_colon.c_str());
+  } else {
+    snprintf(client_id, sizeof(client_id), "aquantia-%s", device_serial_get());
+  }
+
+  bool ok = mqttClient.connect(client_id, mqtt_user, mqtt_pass);
   if (ok) {
     char cmd_topic[64];
     snprintf(cmd_topic, sizeof(cmd_topic), "aquantia/%s/cmd", finca_id);
     mqttClient.subscribe(cmd_topic, 1);
-    Serial.printf("[MQTT] Conectado — suscrito a %s\n", cmd_topic);
+    Serial.printf("[MQTT] Conectado como %s — suscrito a %s\n", client_id, cmd_topic);
   } else {
-    Serial.printf("[MQTT] Error de conexion: rc=%d\n", mqttClient.state());
+    Serial.printf("[MQTT] Error de conexion: rc=%d client_id=%s\n",
+                  mqttClient.state(), client_id);
   }
   return ok;
 }
@@ -937,21 +993,24 @@ bool mqttConnect() {
 // Publicar datos de registro al arranque (una sola vez)
 void mqttPublishRegister() {
   StaticJsonDocument<320> doc;
-  doc["device_serial"] = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
-  doc["mac_address"]   = WiFi.macAddress();
-  doc["ip_address"]    = WiFi.localIP().toString();
-  doc["chip_model"]    = ESP.getChipModel();
-  doc["chip_revision"] = (int)ESP.getChipRevision();
-  doc["cpu_freq_mhz"]  = (int)ESP.getCpuFreqMHz();
-  doc["flash_size_mb"] = (int)(ESP.getFlashChipSize() / 1048576);
+  doc["device_serial"]    = device_serial_get();   // AQ-{MAC}-{FlashID} — identidad hardware
+  doc["mac_address"]      = WiFi.macAddress();
+  doc["ip_address"]       = WiFi.localIP().toString();
+  doc["chip_model"]       = ESP.getChipModel();
+  doc["chip_revision"]    = (int)ESP.getChipRevision();
+  doc["cpu_freq_mhz"]     = (int)ESP.getCpuFreqMHz();
+  doc["flash_size_mb"]    = (int)(ESP.getFlashChipSize() / 1048576);
   doc["sdk_version"]      = ESP.getSdkVersion();
   doc["relay_count"]      = RELAY_COUNT;
   doc["firmware_version"] = FIRMWARE_VERSION;
-  char topic[64], buf[256];
+
+  char topic[64], buf[768];
   snprintf(topic, sizeof(topic), "aquantia/%s/register", finca_id);
-  serializeJson(doc, buf, sizeof(buf));
-  mqttClient.publish(topic, buf, false);
-  Serial.printf("[MQTT] Register publicado: %s\n", buf);
+  size_t payload_len = serializeJson(doc, buf, sizeof(buf));
+  bool ok = mqttClient.publish(topic, buf, false);
+  Serial.printf("[MQTT] Register %s (%u B)\n",
+                ok ? "publicado" : "ERROR",
+                (unsigned)payload_len);
 }
 
 #endif  // !ESP8266 && USE_MQTT
@@ -962,9 +1021,10 @@ void mqttPublishRegister() {
 // =============================================================================
 #ifndef ESP8266
 void networkTask(void* pvParameters) {
-  static bool          deviceInfoSent = false;
-  static unsigned long lastRelayCheck = 0;
-  static unsigned long lastSendTime   = 0;
+  static bool          deviceInfoSent   = false;
+  static unsigned long lastRelayCheck   = 0;
+  static unsigned long lastSendTime     = 0;
+  static unsigned long lastScenarioSync = 0;
 
 #ifdef USE_MQTT
   if (mqtt_port == 8883) {
@@ -977,7 +1037,7 @@ void networkTask(void* pvParameters) {
   }
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(512);
+  mqttClient.setBufferSize(1024);
 #endif
 
   for (;;) {
@@ -995,6 +1055,11 @@ void networkTask(void* pvParameters) {
     }
 
     unsigned long now = millis();
+
+    if (lastScenarioSync == 0 || now - lastScenarioSync >= PIPELINE_SYNC_MS) {
+      syncPipelineScenario();
+      lastScenarioSync = now;
+    }
 
 #ifdef USE_MQTT
     // ── Modo MQTT ────────────────────────────────────────────────────────────
@@ -1015,6 +1080,7 @@ void networkTask(void* pvParameters) {
       float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
       float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
       float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
+      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
       long  snap_heap;
       int   snap_rssi;
       long  snap_uptime;
@@ -1033,6 +1099,8 @@ void networkTask(void* pvParameters) {
         snap_tempDHT11     = temperatureDHT11;
         snap_humDHT11      = humidityDHT11;
         snap_soil          = soilMoisture;
+        snap_pipePressure  = sim_pipeline_pressure;
+        snap_pipeFlow      = sim_pipeline_flow;
         snap_heap          = (long)ESP.getFreeHeap();
         snap_rssi          = WiFi.RSSI();
         snap_uptime        = (long)(millis() / 1000);
@@ -1045,7 +1113,9 @@ void networkTask(void* pvParameters) {
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
-      StaticJsonDocument<512> doc;
+      // 24+ claves JSON: 512 B se quedaba corto y podía truncar los últimos
+      // campos, dejando pipeline_pressure / pipeline_flow fuera del payload.
+      StaticJsonDocument<1024> doc;
       doc["temperature"]           = r2(snap_tempMCP);
       doc["pressure"]              = r2(snap_pressure);
       doc["temperature_barometer"] = r2(snap_tempDHT);
@@ -1062,7 +1132,13 @@ void networkTask(void* pvParameters) {
       doc["uptime_s"]              = snap_uptime;
       doc["relay_active"]          = snap_relayMask;
       doc["soil_moisture"]         = r1(snap_soil);
+      doc["pipeline_pressure"]     = r2(snap_pipePressure);
+      doc["pipeline_flow"]         = r2(snap_pipeFlow);
+      doc["pipeline_scenario"]     = pipelineScenario;
       doc["mac_address"]           = WiFi.macAddress();
+      doc["ip_address"]            = WiFi.localIP().toString();
+      doc["relay_count"]           = RELAY_COUNT;
+      doc["firmware_version"]      = FIRMWARE_VERSION;
       // Timestamp NTP — solo si el reloj está sincronizado (epoch > año 2001)
       // El backend lo usa como timestamp real de la medición en lugar de NOW().
       {
@@ -1070,7 +1146,7 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[512];
+      char topic[64], buf[768];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       serializeJson(doc, buf, sizeof(buf));
       digitalWrite(ledPin, LED_ON);
@@ -1101,6 +1177,7 @@ void networkTask(void* pvParameters) {
       float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
       float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
       float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
+      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
       long  snap_heap;
       int   snap_rssi;
       long  snap_uptime;
@@ -1119,6 +1196,8 @@ void networkTask(void* pvParameters) {
         snap_tempDHT11     = temperatureDHT11;
         snap_humDHT11      = humidityDHT11;
         snap_soil          = soilMoisture;
+        snap_pipePressure  = sim_pipeline_pressure;
+        snap_pipeFlow      = sim_pipeline_flow;
         snap_heap          = (long)ESP.getFreeHeap();
         snap_rssi          = WiFi.RSSI();
         snap_uptime        = (long)(millis() / 1000);
@@ -1128,13 +1207,14 @@ void networkTask(void* pvParameters) {
       }
 
       String url = "https://" + String(server_ip) + "/send_message";
-      char msg[256];
+      char msg[320];
       snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
         snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity,
         snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir,
         snap_light, snap_tempDHT11, snap_humDHT11,
-        snap_rssi, snap_heap, snap_uptime, snap_relayMask, snap_soil
+        snap_rssi, snap_heap, snap_uptime, snap_relayMask,
+        snap_pipePressure, snap_pipeFlow, snap_soil
       );
 
       Serial.printf("[NET] TX: %s\n", msg);
@@ -1187,6 +1267,8 @@ void setup() {
   // ── TFT init PRIMERO — debe ir antes del provisioning para poder mostrar ──
   // el portal AP si el dispositivo no tiene credenciales WiFi en NVS
 #ifdef HAS_DISPLAY
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
@@ -1684,6 +1766,7 @@ void loop() {
 #endif
 
     updateSimulatedValues();
+    updatePipelineSimValues();
 
 #ifndef ESP8266
     if (hasMutex) xSemaphoreGive(dataMutex);
@@ -1721,16 +1804,16 @@ void loop() {
     bool ok = false;
     if (WiFi.status() == WL_CONNECTED) {
       String url = "https://" + String(server_ip) + "/send_message";
-      char msg[256];
+      char msg[320];
       int relayMask = 0;
       for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
       snprintf(msg, sizeof(msg),
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f",
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
         temperatureMCP, (float)pressure, temperatureDHT, humidity,
         windSpeed, currentWindDirDeg, windSpeedFiltered, finalAvgWindDir,
         lightLevel, temperatureDHT11, humidityDHT11,
         WiFi.RSSI(), (long)ESP.getFreeHeap(), (long)(millis()/1000),
-        relayMask, soilMoisture
+        relayMask, sim_pipeline_pressure, sim_pipeline_flow, soilMoisture
       );
       ok = httpPost(url, String(msg));
     } else {
