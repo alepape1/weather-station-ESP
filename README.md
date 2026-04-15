@@ -452,6 +452,15 @@ La rama `test` tiene `#define DEBUG_MODE 1` activo. Cada 5s imprime por Serial:
 
 Útil para verificar el funcionamiento completo sin sensores conectados (modo simulación activo para los sensores ausentes).
 
+### Pipeline: simulación y modo hardware
+
+La beta.2 deja preparada la transición al caudalímetro real:
+
+- `pipeline_mode = sim | real`
+- recepción inmediata de configuración por MQTT dirigida por MAC
+- fallback por lectura HTTP de `/api/pipeline/config`
+- si el sensor real aún no está montado, el firmware mantiene `pipeline_source = fallback` y sigue usando el simulador
+
 ---
 
 ## Ahorro energético
@@ -504,7 +513,7 @@ Ejemplos de ciclo: `v0.1.0-beta.1` → `v0.1.0-rc.1` → `v0.1.0` → `v0.1.1` �
 La versión se define en una sola línea al inicio de `ESP_monitor_server.ino`:
 
 ```cpp
-#define FIRMWARE_VERSION "0.1.0-beta.1"
+#define FIRMWARE_VERSION "0.1.0-beta.2"
 ```
 
 Este valor se envía automáticamente al backend en dos momentos:
