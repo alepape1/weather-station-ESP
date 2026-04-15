@@ -9,6 +9,25 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [v0.1.0-beta.2] — 2026-04-16
+
+**Backend compatible:** `v0.1.0-beta.2`
+
+Beta enfocada en dejar el firmware listo para convivir con el simulador actual y el futuro caudalímetro real.
+
+### Añadido
+- Soporte de `pipeline_mode` con valores `sim` y `real`
+- Comando MQTT dirigido por MAC para aplicar configuración de pipeline al dispositivo correcto
+- Nuevos campos de telemetría: `pipeline_mode`, `pipeline_source`, `pipeline_pressure_ok`, `pipeline_flow_ok`
+
+### Cambiado
+- Sincronización del pipeline mejorada: el ESP32 consulta [GET] `/api/pipeline/config` y mantiene compatibilidad con el esquema anterior
+- El simulador pasa a ser fallback automático cuando el modo hardware está activo pero el sensor aún no está montado
+
+### Corregido
+- El cambio de escenario ya no depende solo de esperar al próximo ciclo largo de polling
+- La base del firmware queda preparada para integrar el driver real del sensor sin romper el flujo existente
+
 ## [v0.1.0-beta.1] — 2026-04-13
 
 **Backend compatible:** `v0.1.0-beta.1`
@@ -80,4 +99,5 @@ Primera versión operativa con FreeRTOS. Incluida en `v0.1.0-beta.1`.
 
 ---
 
+[v0.1.0-beta.2]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.2
 [v0.1.0-beta.1]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.1

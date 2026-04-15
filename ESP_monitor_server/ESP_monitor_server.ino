@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.1.0-beta.1"
+#define FIRMWARE_VERSION "0.1.0-beta.2"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -213,8 +213,12 @@ float sim_windSpeed = 3.5f;
 float sim_windDir        = 180.0f;
 float sim_soilMoisture   = 50.0f;
 
-// ── Pipeline simulado ─────────────────────────────────────────────────────────
-String pipelineScenario      = "normal";  // actualizado desde el servidor cada 20s
+// ── Pipeline simulado / hardware-ready ───────────────────────────────────────
+String pipelineScenario      = "normal";    // normal | leak | burst
+String pipelineMode          = "sim";       // sim | real
+String pipelineSource        = "sim";       // sim | real | fallback
+bool   pipelinePressureOk    = false;
+bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
 
@@ -282,6 +286,40 @@ void updatePipelineSimValues() {
       sim_pipeline_flow     = max(0.0f, fabsf(q_noise) * 0.05f);
     }
   }
+}
+
+static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
+  // Preparado para el futuro caudalímetro y sensor de presión.
+  // Mientras no haya hardware montado devolvemos false y el firmware
+  // usa el simulador como fallback automático.
+  (void)pressureBar;
+  (void)flowLpm;
+  return false;
+}
+
+void updatePipelineValues() {
+  if (pipelineMode == "real") {
+    float realPressure = 0.0f;
+    float realFlow = 0.0f;
+    if (readRealPipelineSensors(realPressure, realFlow)) {
+      sim_pipeline_pressure = max(0.0f, realPressure);
+      sim_pipeline_flow     = max(0.0f, realFlow);
+      pipelineSource        = "real";
+      pipelinePressureOk    = true;
+      pipelineFlowOk        = true;
+      return;
+    }
+
+    pipelineSource     = "fallback";
+    pipelinePressureOk = false;
+    pipelineFlowOk     = false;
+  } else {
+    pipelineSource     = "sim";
+    pipelinePressureOk = false;
+    pipelineFlowOk     = false;
+  }
+
+  updatePipelineSimValues();
 }
 
 // =============================================================================
@@ -668,13 +706,37 @@ String httpGet(const String& url, int timeoutMs = 10000) {
 }
 
 void syncPipelineScenario() {
-  String url = serverBaseUrl() + "/api/pipeline/scenario";
-  String nextScenario = httpGet(url, 2000);
-  if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
-    if (nextScenario != pipelineScenario) {
-      Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
+  String cfgUrl = serverBaseUrl() + "/api/pipeline/config";
+  String body = httpGet(cfgUrl, 2000);
+
+  if (body.length() > 0) {
+    StaticJsonDocument<192> doc;
+    if (!deserializeJson(doc, body)) {
+      String nextScenario = doc["scenario"] | pipelineScenario;
+      String nextMode     = doc["mode"] | pipelineMode;
+
+      if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
+        if (nextScenario != pipelineScenario) {
+          Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
+        }
+        pipelineScenario = nextScenario;
+      }
+      if (nextMode == "sim" || nextMode == "real") {
+        if (nextMode != pipelineMode) {
+          Serial.printf("[PIPE] Modo → %s\n", nextMode.c_str());
+        }
+        pipelineMode = nextMode;
+      }
+      return;
     }
-    pipelineScenario = nextScenario;
+
+    body.trim();
+    if (body == "normal" || body == "leak" || body == "burst") {
+      if (body != pipelineScenario) {
+        Serial.printf("[PIPE] Escenario → %s\n", body.c_str());
+      }
+      pipelineScenario = body;
+    }
   }
 }
 
@@ -953,16 +1015,50 @@ void drawBootScreen(const char* wifiMsg) {
 #if !defined(ESP8266) && defined(USE_MQTT)
 
 // Callback para comandos entrantes en aquantia/<finca_id>/cmd
-// Payload esperado: {"relay": 0, "state": true}
+// Payload esperado: {"relay": 0, "state": true} o {"type":"pipeline_config", ...}
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   if (deserializeJson(doc, payload, length)) return;
-  int  relay = doc["relay"] | 0;
-  bool state = doc["state"] | false;
-  if (relay < 0 || relay >= RELAY_COUNT) return;
-  relayActive[relay] = state;
-  digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
-  Serial.printf("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+
+  String targetMac = doc["mac"] | "";
+  targetMac.trim();
+  targetMac.toUpperCase();
+  String selfMac = WiFi.macAddress();
+  selfMac.trim();
+  selfMac.toUpperCase();
+  if (targetMac.length() > 0 && targetMac != selfMac) return;
+
+  if (doc.containsKey("relay")) {
+    int  relay = doc["relay"] | 0;
+    bool state = doc["state"] | false;
+    if (relay >= 0 && relay < RELAY_COUNT) {
+      relayActive[relay] = state;
+      digitalWrite(RELAY_PINS[relay], state ? LOW : HIGH);  // activo-LOW
+      Serial.printf("[MQTT] Relay %d → %s\n", relay, state ? "ON" : "OFF");
+    }
+  }
+
+  bool updatedPipe = false;
+  String nextScenario = doc["pipeline_scenario"] | pipelineScenario;
+  String nextMode     = doc["pipeline_mode"] | pipelineMode;
+
+  if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
+    if (nextScenario != pipelineScenario) {
+      pipelineScenario = nextScenario;
+      updatedPipe = true;
+    }
+  }
+  if (nextMode == "sim" || nextMode == "real") {
+    if (nextMode != pipelineMode) {
+      pipelineMode = nextMode;
+      updatedPipe = true;
+    }
+  }
+
+  if (updatedPipe) {
+    updatePipelineValues();
+    Serial.printf("[MQTT] Pipeline mode=%s scenario=%s\n", pipelineMode.c_str(), pipelineScenario.c_str());
+  }
 }
 
 // Conectar al broker y suscribirse al topic de comandos
@@ -1135,6 +1231,10 @@ void networkTask(void* pvParameters) {
       doc["pipeline_pressure"]     = r2(snap_pipePressure);
       doc["pipeline_flow"]         = r2(snap_pipeFlow);
       doc["pipeline_scenario"]     = pipelineScenario;
+      doc["pipeline_mode"]         = pipelineMode;
+      doc["pipeline_source"]       = pipelineSource;
+      doc["pipeline_pressure_ok"]  = pipelinePressureOk;
+      doc["pipeline_flow_ok"]      = pipelineFlowOk;
       doc["mac_address"]           = WiFi.macAddress();
       doc["ip_address"]            = WiFi.localIP().toString();
       doc["relay_count"]           = RELAY_COUNT;
@@ -1766,7 +1866,7 @@ void loop() {
 #endif
 
     updateSimulatedValues();
-    updatePipelineSimValues();
+    updatePipelineValues();
 
 #ifndef ESP8266
     if (hasMutex) xSemaphoreGive(dataMutex);
