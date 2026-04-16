@@ -84,11 +84,15 @@
 #include <math.h>
 #include "secrets.h"
 
-// PubSubClient y certificado TLS — solo ESP32 y solo cuando USE_MQTT está definido
+// Certificado TLS reutilizado por HTTPS y MQTT en ESP32.
+#if !defined(ESP8266)
+  #include "mqtt_cert.h"
+#endif
+
+// PubSubClient — solo ESP32 y solo cuando USE_MQTT está definido
 // IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
 #if !defined(ESP8266) && defined(USE_MQTT)
   #include <PubSubClient.h>
-  #include "mqtt_cert.h"
   #include <time.h>
 #endif
 
@@ -636,6 +640,33 @@ static String serverBaseUrl() {
   return url;
 }
 
+#ifndef ESP8266
+static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000) {
+  int handshakeSeconds = timeoutMs / 1000;
+  if (handshakeSeconds < 1) handshakeSeconds = 1;
+  client.setCACert(MQTT_CA_CERT_PEM);
+  client.setHandshakeTimeout(handshakeSeconds);
+}
+#endif
+
+static bool parseRelayBitmask(const String& response, int& bitmaskOut) {
+  String trimmed = response;
+  trimmed.trim();
+  if (trimmed.length() == 0) return false;
+
+  for (size_t i = 0; i < trimmed.length(); i++) {
+    char c = trimmed[i];
+    if (c < '0' || c > '9') return false;
+  }
+
+  long parsed = trimmed.toInt();
+  long maxMask = (1L << RELAY_COUNT) - 1L;
+  if (parsed < 0 || parsed > maxMask) return false;
+
+  bitmaskOut = (int)parsed;
+  return true;
+}
+
 void postDeviceInfo() {
   JsonDocument doc;
 #ifdef ESP8266
@@ -665,8 +696,7 @@ void postDeviceInfo() {
 #else
   if (serverUseTls()) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(10);
+    prepareSecureClient(client, 10000);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -689,8 +719,7 @@ String httpGet(const String& url, int timeoutMs = 10000) {
 #else
   if (url.startsWith("https://")) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(timeoutMs / 1000);
+    prepareSecureClient(client, timeoutMs);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -746,7 +775,12 @@ void checkRelayCommand() {
   String response = httpGet(url, 2000);
   if (response.length() == 0) return;
 
-  int bitmask = response.toInt();
+  int bitmask = 0;
+  if (!parseRelayBitmask(response, bitmask)) {
+    Serial.printf("[Relay] Respuesta invalida ignorada: %s\n", response.c_str());
+    return;
+  }
+
   bool changed = false;
   for (int i = 0; i < RELAY_COUNT; i++) {
     bool desired = (bitmask >> i) & 1;
@@ -763,7 +797,7 @@ void checkRelayCommand() {
     for (int i = 0; i < RELAY_COUNT; i++) {
       if (relayActive[i]) actualMask |= (1 << i);
     }
-    httpPost("https://" + String(server_ip) + "/api/relay/ack", String(actualMask));
+    httpPost(serverBaseUrl() + "/api/relay/ack", String(actualMask));
   }
 }
 
@@ -776,8 +810,7 @@ bool httpPost(const String& url, const String& body) {
 #else
   if (url.startsWith("https://")) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(10);
+    prepareSecureClient(client, 10000);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -1121,12 +1154,15 @@ void networkTask(void* pvParameters) {
   static unsigned long lastRelayCheck   = 0;
   static unsigned long lastSendTime     = 0;
   static unsigned long lastScenarioSync = 0;
+  static unsigned long wifiRetryDelayMs = 500;
 
 #ifdef USE_MQTT
+  static unsigned long mqttRetryDelayMs = 2000;
+
   if (mqtt_port == 8883) {
-    mqttTLSClient.setInsecure();
+    prepareSecureClient(mqttTLSClient, 10000);
     mqttClient.setClient(mqttTLSClient);
-    Serial.printf("[MQTT] Broker TLS: %s:%d\n", mqtt_server, mqtt_port);
+    Serial.printf("[MQTT] Broker TLS verificado: %s:%d\n", mqtt_server, mqtt_port);
   } else {
     mqttClient.setClient(mqttTCPClient);
     Serial.printf("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
@@ -1146,9 +1182,11 @@ void networkTask(void* pvParameters) {
 
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
-      vTaskDelay(500 / portTICK_PERIOD_MS);
+      vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+      if (wifiRetryDelayMs < 5000) wifiRetryDelayMs *= 2;
       continue;
     }
+    wifiRetryDelayMs = 500;
 
     unsigned long now = millis();
 
@@ -1161,9 +1199,11 @@ void networkTask(void* pvParameters) {
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
       if (!mqttConnect()) {
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
+        if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
         continue;
       }
+      mqttRetryDelayMs = 2000;
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
@@ -1173,16 +1213,26 @@ void networkTask(void* pvParameters) {
 
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= MQTT_SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
+      float snap_tempMCP       = temperatureMCP;
+      float snap_pressure      = (float)pressure;
+      float snap_tempDHT       = temperatureDHT;
+      float snap_humidity      = humidity;
+      float snap_windSpeed     = windSpeed;
+      float snap_windDir       = currentWindDirDeg;
+      float snap_windSpeedFilt = windSpeedFiltered;
+      float snap_avgWindDir    = currentWindDirDeg;
+      float snap_light         = lightLevel;
+      float snap_tempDHT11     = temperatureDHT11;
+      float snap_humDHT11      = humidityDHT11;
+      float snap_soil          = soilMoisture;
+      float snap_pipePressure  = sim_pipeline_pressure;
+      float snap_pipeFlow      = sim_pipeline_flow;
+      long  snap_heap          = (long)ESP.getFreeHeap();
+      int   snap_rssi          = WiFi.RSSI();
+      long  snap_uptime        = (long)(millis() / 1000);
+      int   snap_relayMask     = 0;
 
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         snap_tempMCP       = temperatureMCP;
         snap_pressure      = (float)pressure;
         snap_tempDHT       = temperatureDHT;
@@ -1274,16 +1324,26 @@ void networkTask(void* pvParameters) {
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
     if (now - lastSendTime >= SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
+      float snap_tempMCP       = temperatureMCP;
+      float snap_pressure      = (float)pressure;
+      float snap_tempDHT       = temperatureDHT;
+      float snap_humidity      = humidity;
+      float snap_windSpeed     = windSpeed;
+      float snap_windDir       = currentWindDirDeg;
+      float snap_windSpeedFilt = windSpeedFiltered;
+      float snap_avgWindDir    = currentWindDirDeg;
+      float snap_light         = lightLevel;
+      float snap_tempDHT11     = temperatureDHT11;
+      float snap_humDHT11      = humidityDHT11;
+      float snap_soil          = soilMoisture;
+      float snap_pipePressure  = sim_pipeline_pressure;
+      float snap_pipeFlow      = sim_pipeline_flow;
+      long  snap_heap          = (long)ESP.getFreeHeap();
+      int   snap_rssi          = WiFi.RSSI();
+      long  snap_uptime        = (long)(millis() / 1000);
+      int   snap_relayMask     = 0;
 
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         snap_tempMCP       = temperatureMCP;
         snap_pressure      = (float)pressure;
         snap_tempDHT       = temperatureDHT;
@@ -1306,7 +1366,7 @@ void networkTask(void* pvParameters) {
         xSemaphoreGive(dataMutex);
       }
 
-      String url = "https://" + String(server_ip) + "/send_message";
+      String url = serverBaseUrl() + "/send_message";
       char msg[320];
       snprintf(msg, sizeof(msg),
         "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
@@ -1685,7 +1745,7 @@ void setup() {
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
-#ifndef ESP8266
+#if !defined(ESP8266) && !defined(DEV_MODE)
     // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
@@ -1903,7 +1963,7 @@ void loop() {
     finalAvgWindDir = calcAndResetWindVector();
     bool ok = false;
     if (WiFi.status() == WL_CONNECTED) {
-      String url = "https://" + String(server_ip) + "/send_message";
+      String url = serverBaseUrl() + "/send_message";
       char msg[320];
       int relayMask = 0;
       for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
