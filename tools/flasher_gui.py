@@ -23,6 +23,14 @@ import re
 import socket
 import time
 try:
+    import serial
+    from serial.tools import list_ports
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    list_ports = None
+    _SERIAL_AVAILABLE = False
+try:
     import qrcode
     from PIL import ImageTk
     _QR_AVAILABLE = True
@@ -140,27 +148,75 @@ def get_current_version():
     return h, desc, dirty
 
 
-def get_version_list():
-    """Lista de (label_display, git_ref | None) para el selector de versión."""
+def get_current_branch():
+    """Devuelve la rama actual del repositorio."""
+    branch = _git("branch", "--show-current")
+    if branch:
+        return branch
+    return _git("rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+
+
+def branch_has_sketch(branch_ref):
+    """True si la rama contiene el sketch del ESP32."""
+    return bool(_git("ls-tree", "-d", "--name-only", branch_ref, SKETCH_NAME))
+
+
+def get_branch_list():
+    """Lista ramas locales y remotas para el selector."""
+    current = get_current_branch()
+    local = _git(
+        "for-each-ref", "--sort=-committerdate",
+        "--format=%(refname:short)", "refs/heads"
+    ).splitlines()
+    remote = _git(
+        "for-each-ref", "--sort=-committerdate",
+        "--format=%(refname:short)", "refs/remotes"
+    ).splitlines()
+
+    ordered = [current, "main", "master", "origin/main", "origin/master"]
+    ordered.extend(local)
+    ordered.extend(remote)
+
+    branches = []
+    seen = set()
+    for branch in ordered:
+        if not branch or branch.endswith("/HEAD") or branch in seen:
+            continue
+        if not branch_has_sketch(branch):
+            continue
+        branches.append(branch)
+        seen.add(branch)
+    return branches or [current]
+
+
+def get_version_list(branch_ref=None):
+    """Lista de versiones filtrada por la rama seleccionada."""
+    branch_ref = branch_ref or get_current_branch()
+    current_branch = get_current_branch()
     versions = []
 
-    h, desc, dirty = get_current_version()
-    label = f"Actual — {desc}" + (" (cambios sin commit)" if dirty else "")
-    versions.append((label, None))          # None = working copy
+    if branch_ref == current_branch:
+        h, desc, dirty = get_current_version()
+        label = f"Actual — {desc}" + (" (cambios sin commit)" if dirty else "")
+        versions.append((label, None))
 
-    # Últimas 5 etiquetas
-    tags = _git("tag", "--sort=-creatordate").splitlines()
+    tags = _git("tag", "--merged", branch_ref, "--sort=-creatordate").splitlines()
     for tag in tags[:5]:
         if tag:
             versions.append((f"Tag: {tag}", tag))
 
-    # Últimos 10 commits
-    log = _git("log", "--oneline", "-10").splitlines()
-    for line in log:
-        if line:
-            ref  = line[:7]
-            msg  = line[8:50]
-            versions.append((f"{ref}  —  {msg}", ref))
+    log = _git("log", branch_ref, "--oneline", "-12").splitlines()
+    seen_refs = {None}
+    for idx, line in enumerate(log):
+        if not line:
+            continue
+        ref = line[:7]
+        if ref in seen_refs:
+            continue
+        msg = line[8:60]
+        prefix = "HEAD" if idx == 0 else "Commit"
+        versions.append((f"{prefix}: {ref}  —  {msg}", ref))
+        seen_refs.add(ref)
 
     return versions
 
@@ -533,23 +589,38 @@ def discover_ota_devices(timeout=4):
     return found
 
 
-def list_com_ports():
-    try:
-        from serial.tools import list_ports
-        return [p.device for p in list_ports.comports()]
-    except ImportError:
-        pass
-    if sys.platform == "win32":
-        ports = []
+def list_com_ports_detailed():
+    ports = []
+    if _SERIAL_AVAILABLE and list_ports:
+        for p in list_ports.comports():
+            desc = (p.description or "").strip()
+            hwid = (p.hwid or "").strip()
+            label = p.device
+            if desc and desc.lower() != "n/a":
+                label = f"{label} — {desc}"
+            if hwid and hwid.lower() != "n/a":
+                label = f"{label} [{hwid}]"
+            ports.append({"device": p.device, "label": label})
+        return ports
+
+    if sys.platform == "win32" and serial is not None:
         for i in range(1, 21):
+            device = f"COM{i}"
             try:
-                import serial
-                s = serial.Serial(f"COM{i}"); s.close()
-                ports.append(f"COM{i}")
+                s = serial.Serial(device)
+                s.close()
+                ports.append({"device": device, "label": device})
             except Exception:
                 pass
         return ports
-    return glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+
+    for device in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
+        ports.append({"device": device, "label": device})
+    return ports
+
+
+def list_com_ports():
+    return [item["device"] for item in list_com_ports_detailed()]
 
 
 # ── Estado del binario ────────────────────────────────────────────────────────
@@ -622,8 +693,13 @@ class FlasherApp(tk.Tk):
         self._esptool      = find_esptool()
         self._nvs_gen      = find_nvs_gen()
         self._busy         = False
-        self._version_list = get_version_list()
+        self._current_branch = get_current_branch()
+        self._branch_list  = get_branch_list()
+        self._version_list = get_version_list(self._current_branch)
         self._tmp_sketch   = None
+        self._port_choices = []
+        self._serial_stop  = threading.Event()
+        self._serial_running = False
         self._build_ui()
         self._check_tools()
         self._refresh_binary_status()
@@ -656,20 +732,43 @@ class FlasherApp(tk.Tk):
         profile_cb.grid(row=1, column=1, sticky="ew", **PAD)
         profile_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_binary_status())
 
-        # ── Versión ──
-        tk.Label(self, text="Versión:",
-                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="w", **PAD)
+        # ── Rama + versión ──
+        tk.Label(self, text="Origen:",
+                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky="nw", **PAD)
         ver_frame = tk.Frame(self)
         ver_frame.grid(row=2, column=1, sticky="ew", **PAD)
+
+        branch_row = tk.Frame(ver_frame)
+        branch_row.pack(fill="x")
+        tk.Label(branch_row, text="Rama", width=8, anchor="w").pack(side="left")
+        self._branch_var = tk.StringVar(value=self._current_branch)
+        self._branch_cb = ttk.Combobox(
+            branch_row,
+            textvariable=self._branch_var,
+            values=self._branch_list,
+            state="readonly",
+            width=24,
+        )
+        self._branch_cb.pack(side="left")
+        self._branch_cb.bind("<<ComboboxSelected>>", self._on_branch_selected)
+        self._btn_refresh_ver = ttk.Button(
+            branch_row, text="⟳", width=3, command=self._refresh_versions)
+        self._btn_refresh_ver.pack(side="left", padx=4)
+
+        version_row = tk.Frame(ver_frame)
+        version_row.pack(fill="x", pady=(4, 0))
+        tk.Label(version_row, text="Commit", width=8, anchor="w").pack(side="left")
         ver_labels = [v[0] for v in self._version_list]
         self._version_var = tk.StringVar(value=ver_labels[0] if ver_labels else "")
-        self._version_cb  = ttk.Combobox(ver_frame, textvariable=self._version_var,
-                                         values=ver_labels, state="readonly", width=33)
+        self._version_cb = ttk.Combobox(
+            version_row,
+            textvariable=self._version_var,
+            values=ver_labels,
+            state="readonly",
+            width=40,
+        )
         self._version_cb.pack(side="left")
         self._version_cb.bind("<<ComboboxSelected>>", self._on_version_selected)
-        self._btn_refresh_ver = ttk.Button(ver_frame, text="⟳", width=3,
-                                           command=self._refresh_versions)
-        self._btn_refresh_ver.pack(side="left", padx=4)
 
         # ── Info del commit ──
         tk.Label(self, text="Commit:",
@@ -707,11 +806,17 @@ class FlasherApp(tk.Tk):
         port_frame = tk.Frame(self)
         port_frame.grid(row=5, column=1, sticky="ew", **PAD)
         self._port_var = tk.StringVar()
+        self._port_hint_var = tk.StringVar(value="Detectando puertos...")
         self._port_cb  = ttk.Combobox(port_frame, textvariable=self._port_var,
-                                      state="readonly", width=28)
+                                      state="readonly", width=36)
         self._port_cb.pack(side="left")
         ttk.Button(port_frame, text="⟳", width=3,
                    command=self._refresh_ports).pack(side="left", padx=4)
+        self._btn_serial_monitor = ttk.Button(
+            port_frame, text="👀 Serie", width=10, command=self._toggle_serial_monitor)
+        self._btn_serial_monitor.pack(side="left", padx=(0, 4))
+        tk.Label(port_frame, textvariable=self._port_hint_var,
+                 fg="#666", font=("Segoe UI", 8, "italic")).pack(side="left")
         self._refresh_ports()
 
         # ── IP OTA + descubrimiento de dispositivos ──
@@ -852,10 +957,110 @@ class FlasherApp(tk.Tk):
     # ── Helpers UI ────────────────────────────────────────────────────────────
 
     def _refresh_ports(self):
-        ports = list_com_ports()
-        self._port_cb["values"] = ports
-        if ports and not self._port_var.get():
-            self._port_var.set(ports[0])
+        ports = list_com_ports_detailed()
+        self._port_choices = ports
+        labels = [item["label"] for item in ports]
+        self._port_cb["values"] = labels
+
+        current = self._port_var.get()
+        if labels:
+            if current not in labels:
+                self._port_var.set(labels[0])
+            summary = ", ".join(item["device"] for item in ports[:3])
+            if len(ports) > 3:
+                summary += ", ..."
+            self._port_hint_var.set(summary)
+        else:
+            self._port_var.set("")
+            self._port_hint_var.set("sin COM")
+
+        if hasattr(self, "_log"):
+            if labels:
+                self._log_line(
+                    "🔎  Puertos COM: " + " | ".join(labels),
+                    "#888",
+                )
+            else:
+                self._log_line("⚠  No se detectaron puertos COM.", "#f0a000")
+
+    def _get_selected_port(self):
+        sel = self._port_var.get().strip()
+        if not sel:
+            return ""
+        for item in self._port_choices:
+            if item["label"] == sel:
+                return item["device"]
+        return sel.split(" — ", 1)[0].split(" [", 1)[0].strip()
+
+    def _toggle_serial_monitor(self):
+        if self._serial_running:
+            self._stop_serial_monitor(manual=True)
+        else:
+            self._start_serial_monitor()
+
+    def _start_serial_monitor(self):
+        port = self._get_selected_port()
+        if not port:
+            messagebox.showwarning("Puerto requerido", "Selecciona un puerto COM.")
+            return
+        if not _SERIAL_AVAILABLE or serial is None:
+            messagebox.showerror(
+                "Monitor serie no disponible",
+                "Falta pyserial. Instala con: pip install pyserial",
+            )
+            return
+
+        self._serial_stop.clear()
+        self._serial_running = True
+        self._btn_serial_monitor.config(text="🛑 Cerrar")
+        self._log_line(f"● Monitor serie abierto en {port} @ 115200 baudios", "#569cd6")
+        if hasattr(self, "_status_var"):
+            self._set_status(f"Monitor serie activo en {port}")
+
+        def run():
+            ser = None
+            try:
+                ser = serial.Serial(port=port, baudrate=115200, timeout=1)
+                try:
+                    ser.dtr = False
+                    ser.rts = False
+                except Exception:
+                    pass
+
+                while not self._serial_stop.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        self.after(0, lambda t=line: self._log_line(f"[SERIAL] {t}", "#9cdcfe"))
+            except Exception as e:
+                self.after(0, lambda p=port, err=e: self._log_line(
+                    f"✗  No se pudo abrir {p}: {err}", "#f44747"))
+                self.after(0, lambda p=port, err=e: messagebox.showerror(
+                    "Monitor serie", f"No se pudo abrir {p}:\n{err}"))
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                self.after(0, self._serial_monitor_stopped)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stop_serial_monitor(self, manual=False):
+        if not self._serial_running:
+            return
+        if manual and hasattr(self, "_log"):
+            self._log_line("● Cerrando monitor serie...", "#888")
+        self._serial_stop.set()
+
+    def _serial_monitor_stopped(self):
+        self._serial_running = False
+        self._btn_serial_monitor.config(text="👀 Serie")
+        if hasattr(self, "_status_var") and self._status_var.get().startswith("Monitor serie"):
+            self._set_status("Listo")
 
     def _log_line(self, text, color=None):
         self._log.config(state="normal")
@@ -878,10 +1083,12 @@ class FlasherApp(tk.Tk):
 
     def _set_busy(self, busy):
         self._busy = busy
+        if busy:
+            self._stop_serial_monitor()
         state = "disabled" if busy else "normal"
         for btn in (self._btn_compile, self._btn_serial, self._btn_ota,
                     self._btn_factory, self._btn_erase_nvs, self._btn_refresh_ver,
-                    self._btn_discover_ota):
+                    self._btn_discover_ota, self._btn_serial_monitor):
             btn.config(state=state)
         if not busy:
             self._refresh_binary_status()
@@ -994,28 +1201,53 @@ class FlasherApp(tk.Tk):
             self._log_line(f"Error actualizando secrets.h: {e}", "#f44747")
             return None
 
+    def _reload_versions_for_branch(self, branch=None, keep_selection=False):
+        branch = (branch or self._branch_var.get().strip() or self._current_branch)
+        current_label = self._version_var.get().strip()
+        self._version_list = get_version_list(branch)
+        ver_labels = [v[0] for v in self._version_list]
+        self._version_cb["values"] = ver_labels
+
+        if keep_selection and current_label in ver_labels:
+            self._version_var.set(current_label)
+        else:
+            self._version_var.set(ver_labels[0] if ver_labels else "")
+
+        git_ref, _ = self._get_selected_ref()
+        self._update_commit_info(git_ref)
+        self._refresh_binary_status()
+
     def _refresh_versions(self):
-        """git fetch + recarga el selector de versiones."""
+        """git fetch + recarga ramas, tags y commits del selector."""
         if self._busy:
             return
         self._btn_refresh_ver.config(state="disabled")
-        self._set_status("Buscando versiones nuevas...")
+        self._set_status("Buscando ramas y commits...")
 
         def run():
-            self._log_line("\n● git fetch...", "#569cd6")
-            _git("fetch", "--tags", "--prune")
-            self._version_list = get_version_list()
-            ver_labels = [v[0] for v in self._version_list]
-            current = ver_labels[0] if ver_labels else ""
-            self._version_cb["values"] = ver_labels
-            self._version_var.set(current)
-            _, ver_desc, dirty = get_current_version()
-            ver_text = ver_desc + (" [modificado]" if dirty else "")
-            self._hdr_ver_var.set(f"firmware  {ver_text}")
-            self._log_line(f"✓  Versiones actualizadas — {ver_text}", "#4ec9b0")
-            self._set_status("Versiones actualizadas")
-            self._btn_refresh_ver.config(state="normal")
-            self._refresh_binary_status()
+            self._log_line("\n● git fetch --all --tags...", "#569cd6")
+            _git("fetch", "--all", "--tags", "--prune")
+            self._current_branch = get_current_branch()
+            self._branch_list = get_branch_list()
+
+            def on_done():
+                self._branch_cb["values"] = self._branch_list
+                selected_branch = self._branch_var.get().strip()
+                if not selected_branch or selected_branch not in self._branch_list:
+                    selected_branch = self._current_branch
+                    self._branch_var.set(selected_branch)
+                self._reload_versions_for_branch(selected_branch)
+                _, ver_desc, dirty = get_current_version()
+                ver_text = ver_desc + (" [modificado]" if dirty else "")
+                self._hdr_ver_var.set(f"firmware  {ver_text}")
+                self._log_line(
+                    f"✓  Ramas/commits actualizados — rama {selected_branch}",
+                    "#4ec9b0",
+                )
+                self._set_status(f"Rama activa en selector: {selected_branch}")
+                self._btn_refresh_ver.config(state="normal")
+
+            self.after(0, on_done)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1071,6 +1303,13 @@ class FlasherApp(tk.Tk):
             else:
                 self._commit_text.insert("end", "(sin información de commit)", "meta")
         self._commit_text.config(state="disabled")
+
+    def _on_branch_selected(self, _event=None):
+        """Recarga la lista de commits al cambiar de rama."""
+        branch = self._branch_var.get().strip() or self._current_branch
+        self._reload_versions_for_branch(branch)
+        self._log_line(f"✓  Rama seleccionada: {branch}", "#4ec9b0")
+        self._set_status(f"Rama seleccionada: {branch}")
 
     def _on_version_selected(self, _event=None):
         """Maneja la selección de versión: actualiza estado y commit info."""
@@ -1163,6 +1402,17 @@ class FlasherApp(tk.Tk):
             self._log_line("⚠  nvs_partition_gen no encontrado (se usará pip fallback).", "#888")
         else:
             self._log_line(f"✓  nvs_gen:    {self._nvs_gen}", "#4ec9b0")
+        if _SERIAL_AVAILABLE:
+            self._log_line("✓  pyserial: monitor serie disponible", "#4ec9b0")
+        else:
+            self._log_line("⚠  pyserial no instalado: el monitor serie no estará disponible.", "#f0a000")
+        if self._port_choices:
+            self._log_line(
+                "✓  Puertos COM detectados: " + ", ".join(item["label"] for item in self._port_choices),
+                "#4ec9b0",
+            )
+        else:
+            self._log_line("⚠  Sin puertos COM detectados ahora mismo.", "#888")
         _, ver_desc, dirty = get_current_version()
         self._log_line(f"✓  Repositorio: {ver_desc}" + (" [modificado]" if dirty else ""), "#4ec9b0")
         self._log_line(f"✓  Build dir:   {BUILD_DIR}", "#4ec9b0")
@@ -1380,7 +1630,7 @@ class FlasherApp(tk.Tk):
     def _flash_serial(self):
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido", "Selecciona un puerto COM.")
             return
@@ -1477,7 +1727,7 @@ class FlasherApp(tk.Tk):
         """
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido",
                                    "Selecciona el puerto COM del dispositivo.")
@@ -1624,7 +1874,7 @@ class FlasherApp(tk.Tk):
         """
         if self._busy:
             return
-        port = self._port_var.get()
+        port = self._get_selected_port()
         if not port:
             messagebox.showwarning("Puerto requerido",
                                    "Selecciona el puerto COM del dispositivo.")
