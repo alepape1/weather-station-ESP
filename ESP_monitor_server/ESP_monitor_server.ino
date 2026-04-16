@@ -91,9 +91,12 @@
 
 // PubSubClient — solo ESP32 y solo cuando USE_MQTT está definido
 // IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
+#if !defined(ESP8266)
+  #include <time.h>
+#endif
+
 #if !defined(ESP8266) && defined(USE_MQTT)
   #include <PubSubClient.h>
-  #include <time.h>
 #endif
 
 // Provisioning: SoftAP captive portal + NVS (solo ESP32)
@@ -225,6 +228,11 @@ bool   pipelinePressureOk    = false;
 bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
+unsigned long telemetryIntervalMs  = 20000UL;
+unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
+#ifdef HAS_DISPLAY
+unsigned long displayTimeoutMs     = DISPLAY_TIMEOUT_MS;
+#endif
 
 static bool anyRelayActive() {
   for (int i = 0; i < RELAY_COUNT; i++) {
@@ -641,11 +649,28 @@ static String serverBaseUrl() {
 }
 
 #ifndef ESP8266
+static bool tlsClockReady(unsigned long waitMs = 5000) {
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+
+  while (now < 1700000000L && millis() - start < waitMs) {
+    delay(250);
+    now = time(nullptr);
+  }
+  return now >= 1700000000L;
+}
+
 static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000) {
   int handshakeSeconds = timeoutMs / 1000;
   if (handshakeSeconds < 1) handshakeSeconds = 1;
-  client.setCACert(MQTT_CA_CERT_PEM);
+
+  client.stop();
   client.setHandshakeTimeout(handshakeSeconds);
+  client.setCACert(MQTT_CA_CERT_PEM);
+
+  if (!tlsClockReady(5000)) {
+    Serial.println("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
+  }
 }
 #endif
 
@@ -739,10 +764,15 @@ void syncPipelineScenario() {
   String body = httpGet(cfgUrl, 2000);
 
   if (body.length() > 0) {
-    StaticJsonDocument<192> doc;
+    StaticJsonDocument<320> doc;
     if (!deserializeJson(doc, body)) {
       String nextScenario = doc["scenario"] | pipelineScenario;
       String nextMode     = doc["mode"] | pipelineMode;
+      long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+      long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+      long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
 
       if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
         if (nextScenario != pipelineScenario) {
@@ -756,6 +786,29 @@ void syncPipelineScenario() {
         }
         pipelineMode = nextMode;
       }
+      if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+        unsigned long nextMs = (unsigned long)nextTelemetry * 1000UL;
+        if (nextMs != telemetryIntervalMs) {
+          telemetryIntervalMs = nextMs;
+          Serial.printf("[PIPE] Telemetría → %lds\n", nextTelemetry);
+        }
+      }
+      if (nextSync >= 5 && nextSync <= 3600) {
+        unsigned long nextMs = (unsigned long)nextSync * 1000UL;
+        if (nextMs != configSyncIntervalMs) {
+          configSyncIntervalMs = nextMs;
+          Serial.printf("[PIPE] Sync config → %lds\n", nextSync);
+        }
+      }
+#ifdef HAS_DISPLAY
+      if (nextDisplay >= 0 && nextDisplay <= 3600) {
+        unsigned long nextMs = (unsigned long)nextDisplay * 1000UL;
+        if (nextMs != displayTimeoutMs) {
+          displayTimeoutMs = nextMs;
+          Serial.printf("[PIPE] Pantalla timeout → %lds\n", nextDisplay);
+        }
+      }
+#endif
       return;
     }
 
@@ -1074,6 +1127,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   bool updatedPipe = false;
   String nextScenario = doc["pipeline_scenario"] | pipelineScenario;
   String nextMode     = doc["pipeline_mode"] | pipelineMode;
+  long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+  long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+  long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
 
   if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
     if (nextScenario != pipelineScenario) {
@@ -1087,6 +1145,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       updatedPipe = true;
     }
   }
+  if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+    telemetryIntervalMs = (unsigned long)nextTelemetry * 1000UL;
+  }
+  if (nextSync >= 5 && nextSync <= 3600) {
+    configSyncIntervalMs = (unsigned long)nextSync * 1000UL;
+  }
+#ifdef HAS_DISPLAY
+  if (nextDisplay >= 0 && nextDisplay <= 3600) {
+    displayTimeoutMs = (unsigned long)nextDisplay * 1000UL;
+  }
+#endif
 
   if (updatedPipe) {
     updatePipelineValues();
@@ -1190,7 +1259,7 @@ void networkTask(void* pvParameters) {
 
     unsigned long now = millis();
 
-    if (lastScenarioSync == 0 || now - lastScenarioSync >= PIPELINE_SYNC_MS) {
+    if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
       syncPipelineScenario();
       lastScenarioSync = now;
     }
@@ -1212,7 +1281,7 @@ void networkTask(void* pvParameters) {
     mqttClient.loop();
 
     // Publicar telemetría cada MQTT_SEND_MS
-    if (now - lastSendTime >= MQTT_SEND_MS) {
+    if (now - lastSendTime >= telemetryIntervalMs) {
       float snap_tempMCP       = temperatureMCP;
       float snap_pressure      = (float)pressure;
       float snap_tempDHT       = temperatureDHT;
@@ -1323,7 +1392,7 @@ void networkTask(void* pvParameters) {
     }
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
-    if (now - lastSendTime >= SEND_MS) {
+    if (now - lastSendTime >= telemetryIntervalMs) {
       float snap_tempMCP       = temperatureMCP;
       float snap_pressure      = (float)pressure;
       float snap_tempDHT       = temperatureDHT;
@@ -1803,8 +1872,8 @@ void loop() {
     }
     lastActivityTime = now;
   }
-  // Timeout — apagar pantalla tras DISPLAY_TIMEOUT_MS sin actividad
-  if (displayOn && (now - lastActivityTime >= DISPLAY_TIMEOUT_MS)) {
+  // Timeout — apagar pantalla tras el tiempo configurado sin actividad
+  if (displayTimeoutMs > 0 && displayOn && (now - lastActivityTime >= displayTimeoutMs)) {
     digitalWrite(TFT_BL, LOW);
     displayOn = false;
   }
