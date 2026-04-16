@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..,..\\..,..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "C:\\Users\\Perfilador ResCoast\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7,C:\\Users\\Perfilador ResCoast\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7",
+  "otherLibrariesFolders": "C:\\Users\\Perfilador ResCoast\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\Perfilador ResCoast\\Homeserver_Nextcloud\\Documents\\Documentos Alejandro\\Mis repositorios\\Mis repos favoritos\\weather-station-ESP\\ESP_monitor_server"
+}
