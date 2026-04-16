@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.1.0-beta.2"
+#define FIRMWARE_VERSION "0.1.0-beta.3"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
