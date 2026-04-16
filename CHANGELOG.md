@@ -9,6 +9,21 @@ Versiones siguiendo [Semantic Versioning](https://semver.org/lang/es/).
 
 ---
 
+## [v0.1.0-beta.3] — 2026-04-16
+
+**Backend compatible:** `v0.1.0-beta.2`
+
+Beta de estabilización centrada en dejar la conectividad segura y el flujo de flash más robustos antes del siguiente despliegue.
+
+### Cambiado
+- Se endurece la preparación del cliente TLS y la sincronización del reloj antes del handshake MQTT seguro
+- El flujo de compilación y flash queda más afinado para placas TTGO/ESP32 y pruebas locales
+- La herramienta de flasheo muestra mejores pistas para conectar con backend y broker en entorno local
+
+### Corregido
+- Se evita el fallo intermitente de conexión MQTT sobre TLS por cadena CA incompleta o reloj aún no sincronizado
+- El firmware queda listo para salir como siguiente beta sin requerir cambios extra en el backend
+
 ## [v0.1.0-beta.2] — 2026-04-16
 
 **Backend compatible:** `v0.1.0-beta.2`
@@ -99,5 +114,6 @@ Primera versión operativa con FreeRTOS. Incluida en `v0.1.0-beta.1`.
 
 ---
 
+[v0.1.0-beta.3]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.3
 [v0.1.0-beta.2]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.2
 [v0.1.0-beta.1]: https://github.com/alepape1/weather-station-ESP/releases/tag/v0.1.0-beta.1

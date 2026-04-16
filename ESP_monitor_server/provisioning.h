@@ -14,11 +14,13 @@
 
 #ifndef ESP8266  // todo este archivo es solo ESP32
 
+#include <WiFi.h>
+#include <esp_mac.h>
+
+#ifndef DEV_MODE
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <WiFi.h>
-#include <esp_mac.h>
 
 // ── Buffers globales de credenciales ─────────────────────────────────────────
 char prov_ssid[64]       = "";
@@ -31,6 +33,11 @@ static void (*_prov_ap_display_fn)(const char* ap_ssid, const char* serial) = nu
 inline void provisioning_register_ap_display(void (*fn)(const char*, const char*)) {
   _prov_ap_display_fn = fn;
 }
+#else
+inline void provisioning_register_ap_display(void (*fn)(const char*, const char*)) {
+  (void)fn;
+}
+#endif
 
 #define FACTORY_RESET_PIN 0   // GPIO0 — botón BOOT en casi todos los ESP32
 
@@ -52,6 +59,7 @@ const char* device_serial_get() {
   return _device_serial;
 }
 
+#ifndef DEV_MODE
 // ── NVS ──────────────────────────────────────────────────────────────────────
 
 static Preferences _prov_prefs;
@@ -335,21 +343,32 @@ void provisioning_start_ap() {
     server.send(200, "text/html; charset=utf-8", html);
   });
 
+  String cachedScanJson = "[]";
+  unsigned long lastScanStartMs = 0;
+  auto startAsyncScan = [&lastScanStartMs]() {
+    unsigned long now = millis();
+    if (lastScanStartMs == 0 || now - lastScanStartMs >= 5000) {
+      WiFi.scanDelete();
+      WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+      lastScanStartMs = now;
+    }
+  };
+
   // Lanzar scan asíncrono al arrancar el portal (no bloquea)
-  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+  startAsyncScan();
 
   // Escaneo WiFi — devuelve JSON cuando el scan asíncrono ha terminado
-  server.on("/scan", HTTP_GET, [&server]() {
+  server.on("/scan", HTTP_GET, [&server, &cachedScanJson, &startAsyncScan]() {
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_RUNNING) {
       // Todavía escaneando — el cliente reintentará
-      server.send(202, "application/json", "[]");
+      server.send(202, "application/json", cachedScanJson);
       return;
     }
     if (n < 0) {
-      // Error o no iniciado — lanzar nuevo scan asíncrono y devolver vacío
-      WiFi.scanNetworks(/*async=*/true);
-      server.send(200, "application/json", "[]");
+      // Error o no iniciado — lanzar nuevo scan asíncrono y devolver caché
+      startAsyncScan();
+      server.send(202, "application/json", cachedScanJson);
       return;
     }
     String json = "[";
@@ -364,10 +383,9 @@ void provisioning_start_ap() {
               "\"open\":"   + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
     }
     json += "]";
+    cachedScanJson = json;
     WiFi.scanDelete();
-    // Lanzar siguiente scan asíncrono para mantener la lista actualizada
-    WiFi.scanNetworks(/*async=*/true);
-    server.send(200, "application/json", json);
+    server.send(200, "application/json", cachedScanJson);
     Serial.printf("[PROV] Scan: %d redes\n", n);
   });
 
@@ -432,5 +450,7 @@ void provisioning_check_factory_reset() {
   }
   Serial.println(" (< 3s — cancelado)");
 }
+
+#endif  // !DEV_MODE
 
 #endif  // !ESP8266

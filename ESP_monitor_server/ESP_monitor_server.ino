@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.1.0-beta.2"
+#define FIRMWARE_VERSION "0.1.0-beta.3"
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -84,12 +84,19 @@
 #include <math.h>
 #include "secrets.h"
 
-// PubSubClient y certificado TLS — solo ESP32 y solo cuando USE_MQTT está definido
+// Certificado TLS reutilizado por HTTPS y MQTT en ESP32.
+#if !defined(ESP8266)
+  #include "mqtt_cert.h"
+#endif
+
+// PubSubClient — solo ESP32 y solo cuando USE_MQTT está definido
 // IMPORTANTE: este include debe ir DESPUÉS de secrets.h para que USE_MQTT esté definido
+#if !defined(ESP8266)
+  #include <time.h>
+#endif
+
 #if !defined(ESP8266) && defined(USE_MQTT)
   #include <PubSubClient.h>
-  #include "mqtt_cert.h"
-  #include <time.h>
 #endif
 
 // Provisioning: SoftAP captive portal + NVS (solo ESP32)
@@ -221,6 +228,11 @@ bool   pipelinePressureOk    = false;
 bool   pipelineFlowOk        = false;
 float  sim_pipeline_pressure = PIPELINE_STATIC_P;
 float  sim_pipeline_flow     = 0.0f;
+unsigned long telemetryIntervalMs  = 20000UL;
+unsigned long configSyncIntervalMs = PIPELINE_SYNC_MS;
+#ifdef HAS_DISPLAY
+unsigned long displayTimeoutMs     = DISPLAY_TIMEOUT_MS;
+#endif
 
 static bool anyRelayActive() {
   for (int i = 0; i < RELAY_COUNT; i++) {
@@ -636,6 +648,50 @@ static String serverBaseUrl() {
   return url;
 }
 
+#ifndef ESP8266
+static bool tlsClockReady(unsigned long waitMs = 5000) {
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+
+  while (now < 1700000000L && millis() - start < waitMs) {
+    delay(250);
+    now = time(nullptr);
+  }
+  return now >= 1700000000L;
+}
+
+static void prepareSecureClient(WiFiClientSecure& client, int timeoutMs = 10000) {
+  int handshakeSeconds = timeoutMs / 1000;
+  if (handshakeSeconds < 1) handshakeSeconds = 1;
+
+  client.stop();
+  client.setHandshakeTimeout(handshakeSeconds);
+  client.setCACert(MQTT_CA_CERT_PEM);
+
+  if (!tlsClockReady(5000)) {
+    Serial.println("[TLS] Advertencia: reloj aun no sincronizado; reintentando handshake con la CA cargada");
+  }
+}
+#endif
+
+static bool parseRelayBitmask(const String& response, int& bitmaskOut) {
+  String trimmed = response;
+  trimmed.trim();
+  if (trimmed.length() == 0) return false;
+
+  for (size_t i = 0; i < trimmed.length(); i++) {
+    char c = trimmed[i];
+    if (c < '0' || c > '9') return false;
+  }
+
+  long parsed = trimmed.toInt();
+  long maxMask = (1L << RELAY_COUNT) - 1L;
+  if (parsed < 0 || parsed > maxMask) return false;
+
+  bitmaskOut = (int)parsed;
+  return true;
+}
+
 void postDeviceInfo() {
   JsonDocument doc;
 #ifdef ESP8266
@@ -665,8 +721,7 @@ void postDeviceInfo() {
 #else
   if (serverUseTls()) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(10);
+    prepareSecureClient(client, 10000);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -689,8 +744,7 @@ String httpGet(const String& url, int timeoutMs = 10000) {
 #else
   if (url.startsWith("https://")) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(timeoutMs / 1000);
+    prepareSecureClient(client, timeoutMs);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -710,10 +764,15 @@ void syncPipelineScenario() {
   String body = httpGet(cfgUrl, 2000);
 
   if (body.length() > 0) {
-    StaticJsonDocument<192> doc;
+    StaticJsonDocument<320> doc;
     if (!deserializeJson(doc, body)) {
       String nextScenario = doc["scenario"] | pipelineScenario;
       String nextMode     = doc["mode"] | pipelineMode;
+      long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+      long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+      long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
 
       if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
         if (nextScenario != pipelineScenario) {
@@ -727,6 +786,29 @@ void syncPipelineScenario() {
         }
         pipelineMode = nextMode;
       }
+      if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+        unsigned long nextMs = (unsigned long)nextTelemetry * 1000UL;
+        if (nextMs != telemetryIntervalMs) {
+          telemetryIntervalMs = nextMs;
+          Serial.printf("[PIPE] Telemetría → %lds\n", nextTelemetry);
+        }
+      }
+      if (nextSync >= 5 && nextSync <= 3600) {
+        unsigned long nextMs = (unsigned long)nextSync * 1000UL;
+        if (nextMs != configSyncIntervalMs) {
+          configSyncIntervalMs = nextMs;
+          Serial.printf("[PIPE] Sync config → %lds\n", nextSync);
+        }
+      }
+#ifdef HAS_DISPLAY
+      if (nextDisplay >= 0 && nextDisplay <= 3600) {
+        unsigned long nextMs = (unsigned long)nextDisplay * 1000UL;
+        if (nextMs != displayTimeoutMs) {
+          displayTimeoutMs = nextMs;
+          Serial.printf("[PIPE] Pantalla timeout → %lds\n", nextDisplay);
+        }
+      }
+#endif
       return;
     }
 
@@ -746,7 +828,12 @@ void checkRelayCommand() {
   String response = httpGet(url, 2000);
   if (response.length() == 0) return;
 
-  int bitmask = response.toInt();
+  int bitmask = 0;
+  if (!parseRelayBitmask(response, bitmask)) {
+    Serial.printf("[Relay] Respuesta invalida ignorada: %s\n", response.c_str());
+    return;
+  }
+
   bool changed = false;
   for (int i = 0; i < RELAY_COUNT; i++) {
     bool desired = (bitmask >> i) & 1;
@@ -763,7 +850,7 @@ void checkRelayCommand() {
     for (int i = 0; i < RELAY_COUNT; i++) {
       if (relayActive[i]) actualMask |= (1 << i);
     }
-    httpPost("https://" + String(server_ip) + "/api/relay/ack", String(actualMask));
+    httpPost(serverBaseUrl() + "/api/relay/ack", String(actualMask));
   }
 }
 
@@ -776,8 +863,7 @@ bool httpPost(const String& url, const String& body) {
 #else
   if (url.startsWith("https://")) {
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(10);
+    prepareSecureClient(client, 10000);
     http.begin(client, url);
   } else {
     WiFiClient client;
@@ -1041,6 +1127,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   bool updatedPipe = false;
   String nextScenario = doc["pipeline_scenario"] | pipelineScenario;
   String nextMode     = doc["pipeline_mode"] | pipelineMode;
+  long nextTelemetry  = doc["telemetry_interval_s"] | (long)(telemetryIntervalMs / 1000UL);
+  long nextSync       = doc["config_sync_interval_s"] | (long)(configSyncIntervalMs / 1000UL);
+#ifdef HAS_DISPLAY
+  long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
+#endif
 
   if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
     if (nextScenario != pipelineScenario) {
@@ -1054,6 +1145,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       updatedPipe = true;
     }
   }
+  if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
+    telemetryIntervalMs = (unsigned long)nextTelemetry * 1000UL;
+  }
+  if (nextSync >= 5 && nextSync <= 3600) {
+    configSyncIntervalMs = (unsigned long)nextSync * 1000UL;
+  }
+#ifdef HAS_DISPLAY
+  if (nextDisplay >= 0 && nextDisplay <= 3600) {
+    displayTimeoutMs = (unsigned long)nextDisplay * 1000UL;
+  }
+#endif
 
   if (updatedPipe) {
     updatePipelineValues();
@@ -1121,12 +1223,15 @@ void networkTask(void* pvParameters) {
   static unsigned long lastRelayCheck   = 0;
   static unsigned long lastSendTime     = 0;
   static unsigned long lastScenarioSync = 0;
+  static unsigned long wifiRetryDelayMs = 500;
 
 #ifdef USE_MQTT
+  static unsigned long mqttRetryDelayMs = 2000;
+
   if (mqtt_port == 8883) {
-    mqttTLSClient.setInsecure();
+    prepareSecureClient(mqttTLSClient, 10000);
     mqttClient.setClient(mqttTLSClient);
-    Serial.printf("[MQTT] Broker TLS: %s:%d\n", mqtt_server, mqtt_port);
+    Serial.printf("[MQTT] Broker TLS verificado: %s:%d\n", mqtt_server, mqtt_port);
   } else {
     mqttClient.setClient(mqttTCPClient);
     Serial.printf("[MQTT] Broker local sin TLS: %s:%d\n", mqtt_server, mqtt_port);
@@ -1146,13 +1251,15 @@ void networkTask(void* pvParameters) {
 
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
-      vTaskDelay(500 / portTICK_PERIOD_MS);
+      vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
+      if (wifiRetryDelayMs < 5000) wifiRetryDelayMs *= 2;
       continue;
     }
+    wifiRetryDelayMs = 500;
 
     unsigned long now = millis();
 
-    if (lastScenarioSync == 0 || now - lastScenarioSync >= PIPELINE_SYNC_MS) {
+    if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
       syncPipelineScenario();
       lastScenarioSync = now;
     }
@@ -1161,9 +1268,11 @@ void networkTask(void* pvParameters) {
     // ── Modo MQTT ────────────────────────────────────────────────────────────
     if (!mqttClient.connected()) {
       if (!mqttConnect()) {
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(mqttRetryDelayMs));
+        if (mqttRetryDelayMs < 15000) mqttRetryDelayMs += 2000;
         continue;
       }
+      mqttRetryDelayMs = 2000;
       if (!deviceInfoSent) {
         mqttPublishRegister();
         deviceInfoSent = true;
@@ -1172,17 +1281,27 @@ void networkTask(void* pvParameters) {
     mqttClient.loop();
 
     // Publicar telemetría cada MQTT_SEND_MS
-    if (now - lastSendTime >= MQTT_SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
+    if (now - lastSendTime >= telemetryIntervalMs) {
+      float snap_tempMCP       = temperatureMCP;
+      float snap_pressure      = (float)pressure;
+      float snap_tempDHT       = temperatureDHT;
+      float snap_humidity      = humidity;
+      float snap_windSpeed     = windSpeed;
+      float snap_windDir       = currentWindDirDeg;
+      float snap_windSpeedFilt = windSpeedFiltered;
+      float snap_avgWindDir    = currentWindDirDeg;
+      float snap_light         = lightLevel;
+      float snap_tempDHT11     = temperatureDHT11;
+      float snap_humDHT11      = humidityDHT11;
+      float snap_soil          = soilMoisture;
+      float snap_pipePressure  = sim_pipeline_pressure;
+      float snap_pipeFlow      = sim_pipeline_flow;
+      long  snap_heap          = (long)ESP.getFreeHeap();
+      int   snap_rssi          = WiFi.RSSI();
+      long  snap_uptime        = (long)(millis() / 1000);
+      int   snap_relayMask     = 0;
 
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         snap_tempMCP       = temperatureMCP;
         snap_pressure      = (float)pressure;
         snap_tempDHT       = temperatureDHT;
@@ -1273,17 +1392,27 @@ void networkTask(void* pvParameters) {
     }
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
-    if (now - lastSendTime >= SEND_MS) {
-      float snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity;
-      float snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir;
-      float snap_light, snap_tempDHT11, snap_humDHT11, snap_soil;
-      float snap_pipePressure = sim_pipeline_pressure, snap_pipeFlow = sim_pipeline_flow;
-      long  snap_heap;
-      int   snap_rssi;
-      long  snap_uptime;
-      int   snap_relayMask = 0;
+    if (now - lastSendTime >= telemetryIntervalMs) {
+      float snap_tempMCP       = temperatureMCP;
+      float snap_pressure      = (float)pressure;
+      float snap_tempDHT       = temperatureDHT;
+      float snap_humidity      = humidity;
+      float snap_windSpeed     = windSpeed;
+      float snap_windDir       = currentWindDirDeg;
+      float snap_windSpeedFilt = windSpeedFiltered;
+      float snap_avgWindDir    = currentWindDirDeg;
+      float snap_light         = lightLevel;
+      float snap_tempDHT11     = temperatureDHT11;
+      float snap_humDHT11      = humidityDHT11;
+      float snap_soil          = soilMoisture;
+      float snap_pipePressure  = sim_pipeline_pressure;
+      float snap_pipeFlow      = sim_pipeline_flow;
+      long  snap_heap          = (long)ESP.getFreeHeap();
+      int   snap_rssi          = WiFi.RSSI();
+      long  snap_uptime        = (long)(millis() / 1000);
+      int   snap_relayMask     = 0;
 
-      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         snap_tempMCP       = temperatureMCP;
         snap_pressure      = (float)pressure;
         snap_tempDHT       = temperatureDHT;
@@ -1306,7 +1435,7 @@ void networkTask(void* pvParameters) {
         xSemaphoreGive(dataMutex);
       }
 
-      String url = "https://" + String(server_ip) + "/send_message";
+      String url = serverBaseUrl() + "/send_message";
       char msg[320];
       snprintf(msg, sizeof(msg),
         "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
@@ -1685,7 +1814,7 @@ void setup() {
     drawBootScreen(("IP: " + WiFi.localIP().toString()).c_str());
 #endif
   } else {
-#ifndef ESP8266
+#if !defined(ESP8266) && !defined(DEV_MODE)
     // Si las credenciales vinieron de NVS y WiFi falló → volver al portal
     // para que el usuario corrija la red (p.ej. contraseña cambiada).
     if (prov_ssid[0] != '\0') {
@@ -1743,8 +1872,8 @@ void loop() {
     }
     lastActivityTime = now;
   }
-  // Timeout — apagar pantalla tras DISPLAY_TIMEOUT_MS sin actividad
-  if (displayOn && (now - lastActivityTime >= DISPLAY_TIMEOUT_MS)) {
+  // Timeout — apagar pantalla tras el tiempo configurado sin actividad
+  if (displayTimeoutMs > 0 && displayOn && (now - lastActivityTime >= displayTimeoutMs)) {
     digitalWrite(TFT_BL, LOW);
     displayOn = false;
   }
@@ -1903,7 +2032,7 @@ void loop() {
     finalAvgWindDir = calcAndResetWindVector();
     bool ok = false;
     if (WiFi.status() == WL_CONNECTED) {
-      String url = "https://" + String(server_ip) + "/send_message";
+      String url = serverBaseUrl() + "/send_message";
       char msg[320];
       int relayMask = 0;
       for (int i = 0; i < RELAY_COUNT; i++) if (relayActive[i]) relayMask |= (1 << i);
