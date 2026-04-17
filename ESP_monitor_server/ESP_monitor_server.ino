@@ -310,6 +310,10 @@ static bool readRealPipelineSensors(float& pressureBar, float& flowLpm) {
 }
 
 void updatePipelineValues() {
+  // NOTA: esta función se llama desde loop() con dataMutex ya tomado.
+  // Las escrituras de pipelineMode/pipelineScenario desde Core 0 están
+  // protegidas por dataMutex en syncPipelineScenario() y mqttCallback(),
+  // así que la lectura aquí (bajo el mutex del caller) es segura.
   if (pipelineMode == "real") {
     float realPressure = 0.0f;
     float realFlow = 0.0f;
@@ -358,14 +362,14 @@ bool htu_begin() {
   return true;
 }
 
-// Lanza una medición y espera. Devuelve NAN si falla.
+// Lanza una medición y espera. Devuelve NAN si falla o si hay timeout.
 static float htu_measure(uint8_t cmd, uint16_t wait_ms) {
   Wire.beginTransmission(HTU2X_ADDR);
   Wire.write(cmd);
   if (Wire.endTransmission() != 0) return NAN;
   delay(wait_ms);
-  Wire.requestFrom((uint8_t)HTU2X_ADDR, (uint8_t)3, (uint8_t)1);
-  if (Wire.available() < 2) return NAN;
+  uint8_t got = Wire.requestFrom((uint8_t)HTU2X_ADDR, (uint8_t)3, (uint8_t)1);
+  if (got < 2) return NAN;  // timeout o NACK — el sensor no respondió
   uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
   if (Wire.available()) Wire.read();  // descarta CRC
   raw &= 0xFFFC;  // limpia los 2 bits de tipo de medición
@@ -581,23 +585,31 @@ float finalAvgWindDir = 0;
 
 void accumulateWindVector(float deg) {
   float r = deg * PI / 180.0f;
-#ifndef ESP8266
+#ifdef ESP8266
+  noInterrupts();
+#else
   portENTER_CRITICAL(&windMux);
 #endif
   windSumX += cos(r);
   windSumY += sin(r);
   windSampleCount++;
-#ifndef ESP8266
+#ifdef ESP8266
+  interrupts();
+#else
   portEXIT_CRITICAL(&windMux);
 #endif
 }
 
 float calcAndResetWindVector() {
-#ifndef ESP8266
+#ifdef ESP8266
+  noInterrupts();
+#else
   portENTER_CRITICAL(&windMux);
 #endif
   if (windSampleCount == 0) {
-#ifndef ESP8266
+#ifdef ESP8266
+    interrupts();
+#else
     portEXIT_CRITICAL(&windMux);
 #endif
     return 0;
@@ -606,7 +618,9 @@ float calcAndResetWindVector() {
   if (deg < 0) deg += 360.0f;
   windSumX = windSumY = 0;
   windSampleCount = 0;
-#ifndef ESP8266
+#ifdef ESP8266
+  interrupts();
+#else
   portEXIT_CRITICAL(&windMux);
 #endif
   return deg;
@@ -774,6 +788,10 @@ void syncPipelineScenario() {
       long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
 #endif
 
+      // Proteger escrituras de config con mutex (leídas desde Core 1)
+#ifndef ESP8266
+      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+#endif
       if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
         if (nextScenario != pipelineScenario) {
           Serial.printf("[PIPE] Escenario → %s\n", nextScenario.c_str());
@@ -786,6 +804,9 @@ void syncPipelineScenario() {
         }
         pipelineMode = nextMode;
       }
+#ifndef ESP8266
+      if (dataMutex) xSemaphoreGive(dataMutex);
+#endif
       if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
         unsigned long nextMs = (unsigned long)nextTelemetry * 1000UL;
         if (nextMs != telemetryIntervalMs) {
@@ -1133,6 +1154,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   long nextDisplay    = doc["display_timeout_s"] | (long)(displayTimeoutMs / 1000UL);
 #endif
 
+  // Proteger escrituras de Strings con mutex (leídas desde Core 1)
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
   if (nextScenario == "normal" || nextScenario == "leak" || nextScenario == "burst") {
     if (nextScenario != pipelineScenario) {
       pipelineScenario = nextScenario;
@@ -1145,6 +1168,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       updatedPipe = true;
     }
   }
+  if (dataMutex) xSemaphoreGive(dataMutex);
   if (nextTelemetry >= 5 && nextTelemetry <= 3600) {
     telemetryIntervalMs = (unsigned long)nextTelemetry * 1000UL;
   }
@@ -1214,6 +1238,65 @@ void mqttPublishRegister() {
 #endif  // !ESP8266 && USE_MQTT
 
 // =============================================================================
+// Snapshot de datos — captura atómica de sensores para telemetría
+// =============================================================================
+#ifndef ESP8266
+struct TelemetrySnapshot {
+  float tempMCP, pressure, tempDHT, humidity;
+  float windSpeed, windDir, windSpeedFilt, avgWindDir;
+  float light, tempDHT11, humDHT11, soil;
+  float pipePressure, pipeFlow;
+  long  heap, uptime;
+  int   rssi, relayMask;
+};
+
+void takeSnapshot(TelemetrySnapshot &s) {
+  // Defaults sin mutex (último valor conocido)
+  s.tempMCP       = temperatureMCP;
+  s.pressure      = (float)pressure;
+  s.tempDHT       = temperatureDHT;
+  s.humidity      = humidity;
+  s.windSpeed     = windSpeed;
+  s.windDir       = currentWindDirDeg;
+  s.windSpeedFilt = windSpeedFiltered;
+  s.avgWindDir    = currentWindDirDeg;
+  s.light         = lightLevel;
+  s.tempDHT11     = temperatureDHT11;
+  s.humDHT11      = humidityDHT11;
+  s.soil          = soilMoisture;
+  s.pipePressure  = sim_pipeline_pressure;
+  s.pipeFlow      = sim_pipeline_flow;
+  s.heap          = (long)ESP.getFreeHeap();
+  s.rssi          = WiFi.RSSI();
+  s.uptime        = (long)(millis() / 1000);
+  s.relayMask     = 0;
+
+  if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s.tempMCP       = temperatureMCP;
+    s.pressure      = (float)pressure;
+    s.tempDHT       = temperatureDHT;
+    s.humidity      = humidity;
+    s.windSpeed     = windSpeed;
+    s.windDir       = currentWindDirDeg;
+    s.windSpeedFilt = windSpeedFiltered;
+    s.avgWindDir    = calcAndResetWindVector();
+    s.light         = lightLevel;
+    s.tempDHT11     = temperatureDHT11;
+    s.humDHT11      = humidityDHT11;
+    s.soil          = soilMoisture;
+    s.pipePressure  = sim_pipeline_pressure;
+    s.pipeFlow      = sim_pipeline_flow;
+    s.heap          = (long)ESP.getFreeHeap();
+    s.rssi          = WiFi.RSSI();
+    s.uptime        = (long)(millis() / 1000);
+    for (int i = 0; i < RELAY_COUNT; i++)
+      if (relayActive[i]) s.relayMask |= (1 << i);
+    xSemaphoreGive(dataMutex);
+  }
+}
+#endif
+
+// =============================================================================
 // TAREA DE RED — Core 0 (solo ESP32)
 // Gestiona OTA, relay polling y HTTP POST sin bloquear sensores/display (Core 1)
 // =============================================================================
@@ -1223,7 +1306,9 @@ void networkTask(void* pvParameters) {
   static unsigned long lastRelayCheck   = 0;
   static unsigned long lastSendTime     = 0;
   static unsigned long lastScenarioSync = 0;
-  static unsigned long wifiRetryDelayMs = 500;
+  static unsigned long lastNtpRetry     = 0;
+  static unsigned long wifiRetryDelayMs  = 500;
+  static unsigned long wifiStableSince   = 0;  // millis() al reconectar
 
 #ifdef USE_MQTT
   static unsigned long mqttRetryDelayMs = 2000;
@@ -1250,14 +1335,26 @@ void networkTask(void* pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      wifiStableSince = 0;
       WiFi.reconnect();
       vTaskDelay(pdMS_TO_TICKS(wifiRetryDelayMs));
       if (wifiRetryDelayMs < 5000) wifiRetryDelayMs *= 2;
       continue;
     }
-    wifiRetryDelayMs = 500;
+    // Resetear backoff solo tras 10s de conexión estable (evita martillear el AP)
+    if (wifiStableSince == 0) wifiStableSince = millis();
+    if (millis() - wifiStableSince > 10000) wifiRetryDelayMs = 500;
 
     unsigned long now = millis();
+
+#ifdef USE_MQTT
+    // Reintentar NTP cada 60s si el reloj no está sincronizado (fallo en boot)
+    if (time(nullptr) < 1000000000L && (now - lastNtpRetry > 60000 || lastNtpRetry == 0)) {
+      Serial.println("[NTP] Reintentando sincronización...");
+      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      lastNtpRetry = now;
+    }
+#endif
 
     if (lastScenarioSync == 0 || now - lastScenarioSync >= configSyncIntervalMs) {
       syncPipelineScenario();
@@ -1282,47 +1379,8 @@ void networkTask(void* pvParameters) {
 
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= telemetryIntervalMs) {
-      float snap_tempMCP       = temperatureMCP;
-      float snap_pressure      = (float)pressure;
-      float snap_tempDHT       = temperatureDHT;
-      float snap_humidity      = humidity;
-      float snap_windSpeed     = windSpeed;
-      float snap_windDir       = currentWindDirDeg;
-      float snap_windSpeedFilt = windSpeedFiltered;
-      float snap_avgWindDir    = currentWindDirDeg;
-      float snap_light         = lightLevel;
-      float snap_tempDHT11     = temperatureDHT11;
-      float snap_humDHT11      = humidityDHT11;
-      float snap_soil          = soilMoisture;
-      float snap_pipePressure  = sim_pipeline_pressure;
-      float snap_pipeFlow      = sim_pipeline_flow;
-      long  snap_heap          = (long)ESP.getFreeHeap();
-      int   snap_rssi          = WiFi.RSSI();
-      long  snap_uptime        = (long)(millis() / 1000);
-      int   snap_relayMask     = 0;
-
-      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        snap_tempMCP       = temperatureMCP;
-        snap_pressure      = (float)pressure;
-        snap_tempDHT       = temperatureDHT;
-        snap_humidity      = humidity;
-        snap_windSpeed     = windSpeed;
-        snap_windDir       = currentWindDirDeg;
-        snap_windSpeedFilt = windSpeedFiltered;
-        snap_avgWindDir    = calcAndResetWindVector();
-        snap_light         = lightLevel;
-        snap_tempDHT11     = temperatureDHT11;
-        snap_humDHT11      = humidityDHT11;
-        snap_soil          = soilMoisture;
-        snap_pipePressure  = sim_pipeline_pressure;
-        snap_pipeFlow      = sim_pipeline_flow;
-        snap_heap          = (long)ESP.getFreeHeap();
-        snap_rssi          = WiFi.RSSI();
-        snap_uptime        = (long)(millis() / 1000);
-        for (int i = 0; i < RELAY_COUNT; i++)
-          if (relayActive[i]) snap_relayMask |= (1 << i);
-        xSemaphoreGive(dataMutex);
-      }
+      TelemetrySnapshot snap;
+      takeSnapshot(snap);
 
       // Redondeo para reducir tamaño del payload MQTT
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
@@ -1331,24 +1389,24 @@ void networkTask(void* pvParameters) {
       // 24+ claves JSON: 512 B se quedaba corto y podía truncar los últimos
       // campos, dejando pipeline_pressure / pipeline_flow fuera del payload.
       StaticJsonDocument<1024> doc;
-      doc["temperature"]           = r2(snap_tempMCP);
-      doc["pressure"]              = r2(snap_pressure);
-      doc["temperature_barometer"] = r2(snap_tempDHT);
-      doc["humidity"]              = r2(snap_humidity);
-      doc["windSpeed"]             = r2(snap_windSpeed);
-      doc["windDirection"]         = r1(snap_windDir);
-      doc["windSpeedFiltered"]     = r2(snap_windSpeedFilt);
-      doc["windDirectionFiltered"] = r1(snap_avgWindDir);
-      doc["light"]                 = r1(snap_light);
-      doc["dht_temperature"]       = r1(snap_tempDHT11);
-      doc["dht_humidity"]          = r1(snap_humDHT11);
-      doc["rssi"]                  = snap_rssi;
-      doc["free_heap"]             = snap_heap;
-      doc["uptime_s"]              = snap_uptime;
-      doc["relay_active"]          = snap_relayMask;
-      doc["soil_moisture"]         = r1(snap_soil);
-      doc["pipeline_pressure"]     = r2(snap_pipePressure);
-      doc["pipeline_flow"]         = r2(snap_pipeFlow);
+      doc["temperature"]           = r2(snap.tempMCP);
+      doc["pressure"]              = r2(snap.pressure);
+      doc["temperature_barometer"] = r2(snap.tempDHT);
+      doc["humidity"]              = r2(snap.humidity);
+      doc["windSpeed"]             = r2(snap.windSpeed);
+      doc["windDirection"]         = r1(snap.windDir);
+      doc["windSpeedFiltered"]     = r2(snap.windSpeedFilt);
+      doc["windDirectionFiltered"] = r1(snap.avgWindDir);
+      doc["light"]                 = r1(snap.light);
+      doc["dht_temperature"]       = r1(snap.tempDHT11);
+      doc["dht_humidity"]          = r1(snap.humDHT11);
+      doc["rssi"]                  = snap.rssi;
+      doc["free_heap"]             = snap.heap;
+      doc["uptime_s"]              = snap.uptime;
+      doc["relay_active"]          = snap.relayMask;
+      doc["soil_moisture"]         = r1(snap.soil);
+      doc["pipeline_pressure"]     = r2(snap.pipePressure);
+      doc["pipeline_flow"]         = r2(snap.pipeFlow);
       doc["pipeline_scenario"]     = pipelineScenario;
       doc["pipeline_mode"]         = pipelineMode;
       doc["pipeline_source"]       = pipelineSource;
@@ -1365,13 +1423,18 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[768];
+      char topic[64], buf[1024];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
-      serializeJson(doc, buf, sizeof(buf));
+      size_t payload_len = serializeJson(doc, buf, sizeof(buf));
+      if (payload_len >= sizeof(buf)) {
+        Serial.printf("[MQTT] WARN payload truncado (%u >= %u)\n",
+                      (unsigned)payload_len, (unsigned)sizeof(buf));
+      }
       digitalWrite(ledPin, LED_ON);
       bool ok = mqttClient.publish(topic, buf, false);
       digitalWrite(ledPin, LED_OFF);
-      Serial.printf("[MQTT] TX %s: %s\n", ok ? "OK" : "ERROR", buf);
+      Serial.printf("[MQTT] TX %s (%u B): %s\n", ok ? "OK" : "ERROR",
+                    (unsigned)payload_len, buf);
 
       lastServerOK = ok;
       lastSendTime = now;
@@ -1393,57 +1456,18 @@ void networkTask(void* pvParameters) {
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
     if (now - lastSendTime >= telemetryIntervalMs) {
-      float snap_tempMCP       = temperatureMCP;
-      float snap_pressure      = (float)pressure;
-      float snap_tempDHT       = temperatureDHT;
-      float snap_humidity      = humidity;
-      float snap_windSpeed     = windSpeed;
-      float snap_windDir       = currentWindDirDeg;
-      float snap_windSpeedFilt = windSpeedFiltered;
-      float snap_avgWindDir    = currentWindDirDeg;
-      float snap_light         = lightLevel;
-      float snap_tempDHT11     = temperatureDHT11;
-      float snap_humDHT11      = humidityDHT11;
-      float snap_soil          = soilMoisture;
-      float snap_pipePressure  = sim_pipeline_pressure;
-      float snap_pipeFlow      = sim_pipeline_flow;
-      long  snap_heap          = (long)ESP.getFreeHeap();
-      int   snap_rssi          = WiFi.RSSI();
-      long  snap_uptime        = (long)(millis() / 1000);
-      int   snap_relayMask     = 0;
-
-      if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        snap_tempMCP       = temperatureMCP;
-        snap_pressure      = (float)pressure;
-        snap_tempDHT       = temperatureDHT;
-        snap_humidity      = humidity;
-        snap_windSpeed     = windSpeed;
-        snap_windDir       = currentWindDirDeg;
-        snap_windSpeedFilt = windSpeedFiltered;
-        snap_avgWindDir    = calcAndResetWindVector();
-        snap_light         = lightLevel;
-        snap_tempDHT11     = temperatureDHT11;
-        snap_humDHT11      = humidityDHT11;
-        snap_soil          = soilMoisture;
-        snap_pipePressure  = sim_pipeline_pressure;
-        snap_pipeFlow      = sim_pipeline_flow;
-        snap_heap          = (long)ESP.getFreeHeap();
-        snap_rssi          = WiFi.RSSI();
-        snap_uptime        = (long)(millis() / 1000);
-        for (int i = 0; i < RELAY_COUNT; i++)
-          if (relayActive[i]) snap_relayMask |= (1 << i);
-        xSemaphoreGive(dataMutex);
-      }
+      TelemetrySnapshot snap;
+      takeSnapshot(snap);
 
       String url = serverBaseUrl() + "/send_message";
       char msg[320];
       snprintf(msg, sizeof(msg),
         "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%ld,%ld,%d,%.2f,%.2f,%.2f",
-        snap_tempMCP, snap_pressure, snap_tempDHT, snap_humidity,
-        snap_windSpeed, snap_windDir, snap_windSpeedFilt, snap_avgWindDir,
-        snap_light, snap_tempDHT11, snap_humDHT11,
-        snap_rssi, snap_heap, snap_uptime, snap_relayMask,
-        snap_pipePressure, snap_pipeFlow, snap_soil
+        snap.tempMCP, snap.pressure, snap.tempDHT, snap.humidity,
+        snap.windSpeed, snap.windDir, snap.windSpeedFilt, snap.avgWindDir,
+        snap.light, snap.tempDHT11, snap.humDHT11,
+        snap.rssi, snap.heap, snap.uptime, snap.relayMask,
+        snap.pipePressure, snap.pipeFlow, snap.soil
       );
 
       Serial.printf("[NET] TX: %s\n", msg);
@@ -1501,7 +1525,15 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  spr.createSprite(240, 135);
+  void* sprPtr = spr.createSprite(240, 135);
+  if (!sprPtr) {
+    Serial.printf("[TFT] ERROR: createSprite falló (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+    // Fallback: dibujar directamente en tft sin sprite
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("SPRITE FAIL", 120, 60, 4);
+  } else {
+    Serial.printf("[TFT] Sprite creado OK (heap libre: %ld)\n", (long)ESP.getFreeHeap());
+  }
   spr.setSwapBytes(true);
   pinMode(BTN_LEFT,  INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT);
@@ -1510,6 +1542,12 @@ void setup() {
   provisioning_register_ap_display([](const char* ap_ssid, const char* serial) {
     drawAPScreen(ap_ssid, serial);
   });
+  // Diagnóstico TFT — dibujar directamente en el display (sin sprite) para verificar
+  tft.fillScreen(TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawCentreString("TFT OK", 120, 50, 4);
+  tft.drawCentreString(String(ESP.getFreeHeap()).c_str(), 120, 85, 2);
+  delay(1500);
   drawBootScreen("Iniciando...");
 #endif
 
@@ -1551,6 +1589,9 @@ void setup() {
 
   Serial.println("Iniciando I2C...");
   Wire.begin(I2C_SDA, I2C_SCL);
+#ifndef ESP8266
+  Wire.setTimeOut(100);  // timeout 100ms para evitar hang si un sensor no responde
+#endif
   Serial.println("I2C OK");
 
   // Escaner I2C — detecta todos los dispositivos en el bus
@@ -1770,13 +1811,17 @@ void setup() {
     {
       time_t now = time(nullptr);
       int ntpTries = 0;
-      while (now < 1000000000L && ntpTries < 20) {
+      while (now < 1000000000L && ntpTries < 40) {
         delay(500);
         Serial.print(".");
         now = time(nullptr);
         ntpTries++;
       }
-      Serial.printf("\n[NTP] Hora: %s", ctime(&now));
+      if (now < 1000000000L) {
+        Serial.println("\n[NTP] WARN: reloj no sincronizado — timestamps no fiables");
+      } else {
+        Serial.printf("\n[NTP] Hora: %s", ctime(&now));
+      }
     }
 #endif
 

@@ -681,8 +681,8 @@ def binary_is_valid(profile, git_ref):
     return True, f"OK  ·  {size_kb} KB  ·  compilado {built_at}"
 
 
-# ── Aplicación ────────────────────────────────────────────────────────────────
-
+# ── Aplicación 
+ 
 class FlasherApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2010,7 +2010,7 @@ class FlasherApp(tk.Tk):
             self._set_busy(False)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main 
 
 if __name__ == "__main__":
     app = FlasherApp()
