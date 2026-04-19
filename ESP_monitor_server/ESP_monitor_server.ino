@@ -1,13 +1,13 @@
 // MeteoStation — Firmware v3
 // Compatible con ESP32 (con pantalla ST7789 240×135) y ESP8266 (sin pantalla)
-// Sensores: MCP9808, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
+// Sensores: MCP9808, BMP280, HTU2x, SparkFun MicroPressure, TSL2584/APDS, anemómetro, veleta
 // Tres temporizadores independientes: 100ms viento / 1s pantalla / 20s envío
 
 // ── Versión del firmware ───────────────────────────────────────────────────────
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.1.0-beta.3"     
+#define FIRMWARE_VERSION "0.1.0-beta.5"     
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -45,8 +45,8 @@
   #define DHTPIN           15
   #define ADC_VOLTAGE_REF  3.41f
   #define ADC_RANGE        4096.0f
-  #define ANEMOMETER_PIN   37
-  #define VANE_PIN         36
+  #define ANEMOMETER_PIN   36
+  #define VANE_PIN         37
   #if DEVICE_PROFILE == PROFILE_METEO
     #define SOIL_PIN         33   // YL-69 humedad suelo (ADC1_CH5) — solo PROFILE_METEO
     #define SOIL_RAW_DRY   3300   // ADC en tierra seca (~0%) — ajustar con valor raw del serial
@@ -74,6 +74,7 @@
     typedef uint8_t BitOrder;
   #endif
   #include <Adafruit_MCP9808.h>
+  #include <Adafruit_BMP280.h>
   #include <SparkFun_MicroPressure.h>
   #include <DHTesp.h>
 #else
@@ -165,6 +166,7 @@ const int ledPin = 2;
 #if DEVICE_PROFILE == PROFILE_METEO
   SparkFun_MicroPressure barometer;
   Adafruit_MCP9808       tempsensor = Adafruit_MCP9808();
+  Adafruit_BMP280        bmp280;
   DHTesp                 dht;
 #endif
 
@@ -188,12 +190,59 @@ static PubSubClient     mqttClient;
 
 // ── Flags de sensor ────────────────────────────────────────────────────────────
 bool mcp_ok = false;
+bool bmp_ok = false;
+bool bmp_temp_ok = false;
+bool bmp_pressure_ok = false;
+bool micropressure_ok = false;
+bool temp_ok = false;
 bool bar_ok = false;
 bool htu_ok = false;
 #if DEVICE_PROFILE == PROFILE_METEO
 bool dht_ok = false;
+static uint8_t bmp280_addr = 0x00;
 #endif
 bool tsl_ok = false;
+
+#if DEVICE_PROFILE == PROFILE_METEO
+static bool beginBMP280() {
+  if (bmp280.begin(0x76)) {
+    bmp280_addr = 0x76;
+    return true;
+  }
+  if (bmp280.begin(0x77)) {
+    bmp280_addr = 0x77;
+    return true;
+  }
+  bmp280_addr = 0x00;
+  return false;
+}
+
+static bool readBMP280Temperature(float& outTemp) {
+  outTemp = bmp280.readTemperature();
+  return !isnan(outTemp) && outTemp > -40.0f && outTemp < 85.0f;
+}
+
+static bool readBMP280PressureKPa(float& outPressure) {
+  outPressure = bmp280.readPressure() / 1000.0f;
+  return !isnan(outPressure) && outPressure > 30.0f && outPressure < 120.0f;
+}
+#endif
+
+static const char* temperatureSourceName() {
+#if DEVICE_PROFILE == PROFILE_METEO
+  if (mcp_ok) return "MCP9808";
+  if (bmp_temp_ok) return "BMP280";
+#endif
+  return "SIM";
+}
+
+static const char* pressureSourceName() {
+#if DEVICE_PROFILE == PROFILE_METEO
+  if (micropressure_ok) return "MicroPressure";
+  if (bmp_pressure_ok) return "BMP280";
+#endif
+  return "SIM";
+}
 
 // ── Valores medidos ────────────────────────────────────────────────────────────
 float  temperatureMCP    = 0;
@@ -201,6 +250,8 @@ float  temperatureDHT    = 0;   // HTU2x temperatura
 float  humidity          = 0;   // HTU2x humedad
 float  temperatureDHT11  = 0;   // DHT11 temperatura
 float  humidityDHT11     = 0;   // DHT11 humedad
+float  bmpTemperature    = NAN; // BMP280 temperatura directa
+float  bmpPressure       = NAN; // BMP280 presión directa en kPa
 double pressure          = 0;
 float  windSpeed         = 0;
 float  windSpeedFiltered = 0;
@@ -582,6 +633,7 @@ struct TelemetrySnapshot {
   float tempMCP, pressure, tempDHT, humidity;
   float windSpeed, windDir, windSpeedFilt, avgWindDir;
   float light, tempDHT11, humDHT11, soil;
+  float bmpTemp, bmpPressure;
   float pipePressure, pipeFlow;
   long  heap, uptime;
   int   rssi, relayMask;
@@ -1057,7 +1109,7 @@ void drawScreen() {
   spr.fillCircle(230, 9, 5, srvCol);
   spr.drawCircle(230, 9, 5, C_TEXT);
 
-  drawCard(0, 0, "T.EXT",   temperatureMCP,     "C",    !mcp_ok);
+  drawCard(0, 0, "T.EXT",   temperatureMCP,     "C",    !temp_ok);
   drawCard(1, 0, "T.INT",   temperatureDHT,     "C",    !htu_ok);
   drawCard(2, 0, "HUMEDAD", humidity,           "%",    !htu_ok);
   drawCard(0, 1, "PRESION", (float)pressure,    "KPa",  !bar_ok);
@@ -1269,6 +1321,8 @@ void takeSnapshot() {
   s.tempDHT11     = temperatureDHT11;
   s.humDHT11      = humidityDHT11;
   s.soil          = soilMoisture;
+  s.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
+  s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
   s.pipePressure  = sim_pipeline_pressure;
   s.pipeFlow      = sim_pipeline_flow;
   s.heap          = (long)ESP.getFreeHeap();
@@ -1289,6 +1343,8 @@ void takeSnapshot() {
     s.tempDHT11     = temperatureDHT11;
     s.humDHT11      = humidityDHT11;
     s.soil          = soilMoisture;
+    s.bmpTemp       = bmp_temp_ok ? bmpTemperature : NAN;
+    s.bmpPressure   = bmp_pressure_ok ? bmpPressure : NAN;
     s.pipePressure  = sim_pipeline_pressure;
     s.pipeFlow      = sim_pipeline_flow;
     s.heap          = (long)ESP.getFreeHeap();
@@ -1394,13 +1450,17 @@ void networkTask(void* pvParameters) {
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
       auto r1 = [](float x){ return roundf(x * 10.0f)  / 10.0f;  };  // 1 decimal
 
-      // 24+ claves JSON: 512 B se quedaba corto y podía truncar los últimos
-      // campos, dejando pipeline_pressure / pipeline_flow fuera del payload.
-      StaticJsonDocument<1024> doc;
+      // Payload ampliado con métricas explícitas del BMP280.
+      StaticJsonDocument<1280> doc;
       doc["temperature"]           = r2(snap.tempMCP);
       doc["pressure"]              = r2(snap.pressure);
       doc["temperature_barometer"] = r2(snap.tempDHT);
       doc["humidity"]              = r2(snap.humidity);
+      doc["temperature_source"]    = temperatureSourceName();
+      doc["pressure_source"]       = pressureSourceName();
+      doc["bmp280_ok"]             = bmp_ok && (bmp_temp_ok || bmp_pressure_ok);
+      if (!isnan(snap.bmpTemp))     doc["bmp280_temperature"] = r2(snap.bmpTemp);
+      if (!isnan(snap.bmpPressure)) doc["bmp280_pressure"] = r2(snap.bmpPressure);
       doc["windSpeed"]             = r2(snap.windSpeed);
       doc["windDirection"]         = r1(snap.windDir);
       doc["windSpeedFiltered"]     = r2(snap.windSpeedFilt);
@@ -1431,7 +1491,7 @@ void networkTask(void* pvParameters) {
         if (ntp_ts > 1000000000L) doc["ts"] = (long)ntp_ts;
       }
 
-      char topic[64], buf[1024];
+      char topic[64], buf[1280];
       snprintf(topic, sizeof(topic), "aquantia/%s/telemetry", finca_id);
       size_t payload_len = serializeJson(doc, buf, sizeof(buf));
       if (payload_len >= sizeof(buf)) {
@@ -1645,19 +1705,49 @@ void setup() {
     tempsensor.setResolution(3);
     Serial.println("MCP9808 OK");
   } else {
-    Serial.println("MCP9808 no detectado — modo simulacion");
-    temperatureMCP = sim_tempMCP;
+    Serial.println("MCP9808 no detectado");
   }
 
-  bar_ok = barometer.begin();
-  if (bar_ok) {
-    Serial.println("Barometro OK");
+  bmp_ok = beginBMP280();
+  if (bmp_ok) {
+    float tBmp = NAN;
+    float pBmp = NAN;
+    bmp_temp_ok = readBMP280Temperature(tBmp);
+    bmp_pressure_ok = readBMP280PressureKPa(pBmp);
+    if (bmp_temp_ok) bmpTemperature = tBmp;
+    if (bmp_pressure_ok) bmpPressure = pBmp;
+    Serial.printf("BMP280 OK (0x%02X)\n", bmp280_addr);
+  } else {
+    bmp_temp_ok = false;
+    bmp_pressure_ok = false;
+    Serial.println("BMP280 no detectado");
+  }
+
+  temp_ok = mcp_ok || bmp_temp_ok;
+  if (!temp_ok) {
+    Serial.println("Temperatura externa sin sensor real — modo simulacion");
+    temperatureMCP = sim_tempMCP;
+  } else if (!mcp_ok && bmp_temp_ok) {
+    temperatureMCP = bmpTemperature;
+    Serial.println("Temperatura externa usara BMP280");
+  }
+
+  micropressure_ok = barometer.begin();
+  bar_ok = micropressure_ok || bmp_pressure_ok;
+  if (micropressure_ok) {
+    Serial.println("Barometro MicroPressure OK");
+  } else if (bmp_pressure_ok) {
+    pressure = bmpPressure;
+    Serial.println("MicroPressure no detectado — usando BMP280 como barometro");
   } else {
     Serial.println("Barometro no detectado — modo simulacion");
     pressure = sim_pressure;
   }
+  Serial.printf("Sensores activos → TempExt:%s | Presion:%s\n",
+    temperatureSourceName(), pressureSourceName());
 #else
   Serial.println("MCP9808 — perfil IRRIGATION, sensor omitido");
+  Serial.println("BMP280 — perfil IRRIGATION, sensor omitido");
   Serial.println("Barometro — perfil IRRIGATION, sensor omitido");
 #endif
 
@@ -1894,8 +1984,8 @@ void setup() {
     (DEVICE_PROFILE == PROFILE_METEO) ? "METEO" : "IRRIGATION", RELAY_COUNT);
   Serial.printf("[TEST] WiFi     : %s\n",
     (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "SIN CONEXION");
-  Serial.printf("[TEST] MCP9808  : %s\n", mcp_ok ? "REAL" : "SIM (sin sensor)");
-  Serial.printf("[TEST] Barometro: %s\n", bar_ok ? "REAL" : "SIM (sin sensor)");
+  Serial.printf("[TEST] Temp ext : %s\n", temp_ok ? temperatureSourceName() : "SIM (sin sensor)");
+  Serial.printf("[TEST] Barometro: %s\n", bar_ok ? pressureSourceName() : "SIM (sin sensor)");
   Serial.printf("[TEST] HTU2x    : %s\n", htu_ok ? "REAL" : "SIM (sin sensor)");
   Serial.printf("[TEST] Luz      : %s\n", tsl_ok ? "REAL" : "SIM (sin sensor)");
 #if DEVICE_PROFILE == PROFILE_METEO
@@ -1962,29 +2052,61 @@ void loop() {
 #endif
 
 #if DEVICE_PROFILE == PROFILE_METEO
-    // MCP9808
+    // BMP280 — leer siempre para mandar sus datos explícitos por telemetría
+    bmp_temp_ok = false;
+    bmp_pressure_ok = false;
+    if (bmp_ok) {
+      float tBmp = NAN;
+      float pBmp = NAN;
+      if (readBMP280Temperature(tBmp)) {
+        bmpTemperature = tBmp;
+        bmp_temp_ok = true;
+      }
+      if (readBMP280PressureKPa(pBmp)) {
+        bmpPressure = pBmp;
+        bmp_pressure_ok = true;
+      }
+      if (!bmp_temp_ok && !bmp_pressure_ok) {
+        bmp_ok = false;
+        Serial.println("BMP280 fallo en lectura — cambiando a simulacion");
+      }
+    }
+
+    // Temperatura exterior — prioridad MCP9808, fallback BMP280
+    temp_ok = false;
     if (mcp_ok) {
       tempsensor.wake();
       float t = tempsensor.readTempC();
       tempsensor.shutdown_wake(1);
       if (!isnan(t) && t > -40.0f) {
         temperatureMCP = t;
+        temp_ok = true;
       } else {
         mcp_ok = false;
-        Serial.println("MCP9808 fallo en lectura — cambiando a simulacion");
+        Serial.println("MCP9808 fallo en lectura — probando BMP280");
       }
     }
-    if (!mcp_ok) temperatureMCP = sim_tempMCP;
+    if (!temp_ok && bmp_temp_ok) {
+      temperatureMCP = bmpTemperature;
+      temp_ok = true;
+    }
+    if (!temp_ok) temperatureMCP = sim_tempMCP;
 
-    // Barómetro
-    if (bar_ok) {
+    // Barómetro — prioridad MicroPressure, fallback BMP280
+    bar_ok = false;
+    if (micropressure_ok) {
       double p = barometer.readPressure(KPA);
-      if (p > 50.0) {
+      if (p > 50.0 && p < 120.0) {
         pressure = p;
+        bar_ok = true;
       } else {
-        bar_ok = false;
-        Serial.println("Barometro fallo en lectura — cambiando a simulacion");
+        micropressure_ok = false;
+        Serial.println("MicroPressure fallo en lectura — probando BMP280");
       }
+    }
+    if (!bar_ok && bmp_pressure_ok) {
+      pressure = bmpPressure;
+      bar_ok = true;
     }
     if (!bar_ok) pressure = sim_pressure;
 #endif
@@ -2156,8 +2278,10 @@ void loop() {
     // Estado de sensores
     Serial.print("[SENSOR]");
 #if DEVICE_PROFILE == PROFILE_METEO
-    Serial.printf(" MCP9808:%s  Barometro:%s  DHT11:%s",
-      mcp_ok ? "REAL" : "SIM", bar_ok ? "REAL" : "SIM", dht_ok ? "REAL" : "SIM");
+    Serial.printf(" TempExt:%s  Barometro:%s  DHT11:%s",
+      temp_ok ? temperatureSourceName() : "SIM",
+      bar_ok ? pressureSourceName() : "SIM",
+      dht_ok ? "REAL" : "SIM");
 #else
     Serial.print(" MCP9808:N/A  Barometro:N/A  DHT11:N/A");
 #endif
