@@ -7,7 +7,7 @@
 // Incrementar según SemVer al crear un release. El backend almacena este valor
 // en device_info.firmware_version para mostrar en el dashboard y detectar
 // dispositivos desactualizados (comparado con app_settings.min_firmware_version).
-#define FIRMWARE_VERSION "0.1.0-beta.3"
+#define FIRMWARE_VERSION "0.1.0-beta.3"     
 
 // ── Perfiles de dispositivo — deben ir PRIMERO para que los #if funcionen ─────
 #define PROFILE_METEO       1   // ECU meteorológica — 1 relay (GPIO RELAY_PIN)
@@ -39,7 +39,7 @@
   #include <HTTPClient.h>
   #include <WiFiClientSecure.h>
   #include <ArduinoOTA.h>
-  #include "driver/rtc_io.h" // Añade esto al principio del archivo
+  #include "driver/rtc_io.h"
   #define I2C_SDA          21
   #define I2C_SCL          22
   #define DHTPIN           15
@@ -576,6 +576,16 @@ volatile bool        isUpdatingOTA = false;
 portMUX_TYPE         windMux       = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t    dataMutex     = nullptr;
 TaskHandle_t         networkTaskHandle = nullptr;
+
+// ── Snapshot de telemetría — struct global para evitar auto-prototype de Arduino ──
+struct TelemetrySnapshot {
+  float tempMCP, pressure, tempDHT, humidity;
+  float windSpeed, windDir, windSpeedFilt, avgWindDir;
+  float light, tempDHT11, humDHT11, soil;
+  float pipePressure, pipeFlow;
+  long  heap, uptime;
+  int   rssi, relayMask;
+} _netSnap;
 #endif
 
 // ── Promedio vectorial de dirección ────────────────────────────────────────────
@@ -1238,19 +1248,14 @@ void mqttPublishRegister() {
 #endif  // !ESP8266 && USE_MQTT
 
 // =============================================================================
-// Snapshot de datos — captura atómica de sensores para telemetría
+// Snapshot de datos — captura atómica de sensores para telemetría.
+// Rellena la variable global _netSnap (definida junto a los vars FreeRTOS).
+// Sin parámetros para evitar el problema de auto-prototype del Arduino IDE
+// con tipos personalizados en la firma.
 // =============================================================================
 #ifndef ESP8266
-struct TelemetrySnapshot {
-  float tempMCP, pressure, tempDHT, humidity;
-  float windSpeed, windDir, windSpeedFilt, avgWindDir;
-  float light, tempDHT11, humDHT11, soil;
-  float pipePressure, pipeFlow;
-  long  heap, uptime;
-  int   rssi, relayMask;
-};
-
-void takeSnapshot(TelemetrySnapshot &s) {
+void takeSnapshot() {
+  TelemetrySnapshot &s = _netSnap;
   // Defaults sin mutex (último valor conocido)
   s.tempMCP       = temperatureMCP;
   s.pressure      = (float)pressure;
@@ -1302,6 +1307,9 @@ void takeSnapshot(TelemetrySnapshot &s) {
 // =============================================================================
 #ifndef ESP8266
 void networkTask(void* pvParameters) {
+  // Tarea separada de red para no bloquear sensores ni la UI principal.
+  // Mantiene yields periódicos con vTaskDelay() al final del bucle.
+
   static bool          deviceInfoSent   = false;
   static unsigned long lastRelayCheck   = 0;
   static unsigned long lastSendTime     = 0;
@@ -1379,8 +1387,8 @@ void networkTask(void* pvParameters) {
 
     // Publicar telemetría cada MQTT_SEND_MS
     if (now - lastSendTime >= telemetryIntervalMs) {
-      TelemetrySnapshot snap;
-      takeSnapshot(snap);
+      takeSnapshot();
+      const TelemetrySnapshot& snap = _netSnap;
 
       // Redondeo para reducir tamaño del payload MQTT
       auto r2 = [](float x){ return roundf(x * 100.0f) / 100.0f; };  // 2 decimales
@@ -1456,8 +1464,8 @@ void networkTask(void* pvParameters) {
 
     // HTTP POST cada SEND_MS — captura snapshot con mutex
     if (now - lastSendTime >= telemetryIntervalMs) {
-      TelemetrySnapshot snap;
-      takeSnapshot(snap);
+      takeSnapshot();
+      const TelemetrySnapshot& snap = _netSnap;
 
       String url = serverBaseUrl() + "/send_message";
       char msg[320];
@@ -1517,7 +1525,16 @@ void setup() {
   Serial.printf("[TEST] MAC ROM : %s\n", device_serial_get());
 #endif  // DEBUG_MODE
 
-  // ── TFT init PRIMERO — debe ir antes del provisioning para poder mostrar ──
+  // I2C debe inicializarse antes del TFT para que el periman de ESP32 core 3.x
+  // registre los pines correctamente antes de que SPI los reclame.
+  Serial.println("Iniciando I2C...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+#ifndef ESP8266
+  Wire.setTimeOut(100);  // timeout 100ms para evitar hang si un sensor no responde
+#endif
+  Serial.println("I2C OK");
+
+  // ── TFT init — debe ir antes del provisioning para poder mostrar ──
   // el portal AP si el dispositivo no tiene credenciales WiFi en NVS
 #ifdef HAS_DISPLAY
   pinMode(TFT_BL, OUTPUT);
@@ -1586,13 +1603,6 @@ void setup() {
   password = prov_password;
   Serial.printf("[PROV] WiFi: %s  |  Serial: %s\n", prov_ssid, device_serial_get());
 #endif  // DEV_MODE / producción
-
-  Serial.println("Iniciando I2C...");
-  Wire.begin(I2C_SDA, I2C_SCL);
-#ifndef ESP8266
-  Wire.setTimeOut(100);  // timeout 100ms para evitar hang si un sensor no responde
-#endif
-  Serial.println("I2C OK");
 
   // Escaner I2C — detecta todos los dispositivos en el bus
   Serial.println("Escaneando bus I2C...");

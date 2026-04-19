@@ -15,6 +15,7 @@ import shutil
 import json
 import datetime
 import tempfile
+import hashlib
 import secrets as _secrets
 import csv
 import urllib.request
@@ -22,6 +23,18 @@ from urllib.parse import urlparse
 import re
 import socket
 import time
+
+if os.name == "nt":
+    _WINDOWS_HIDDEN_SUBPROCESS = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    if hasattr(subprocess, "STARTUPINFO"):
+        _startupinfo = subprocess.STARTUPINFO()
+        _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _startupinfo.wShowWindow = 0
+        _WINDOWS_HIDDEN_SUBPROCESS["startupinfo"] = _startupinfo
+else:
+    _WINDOWS_HIDDEN_SUBPROCESS = {}
 try:
     import serial
     from serial.tools import list_ports
@@ -65,7 +78,12 @@ ESPOTA_GLOB_PATTERNS = [
     "/home/*/.arduino15/packages/esp32/hardware/esp32/*/tools/espota.py",
 ]
 
-FQBN = "esp32:esp32:esp32"
+# FQBN por perfil — METEO usa el board LilyGo T-Display para que TFT_eSPI
+# reciba el define ARDUINO_LILYGO_T_DISPLAY y configure los pines del ST7789.
+FQBN_BY_PROFILE = {
+    "1": "esp32:esp32:lilygo_t_display",   # METEO — LilyGo TTGO T-Display
+    "2": "esp32:esp32:esp32",              # IRRIGATION — ESP32 genérico
+}
 
 BACKEND_URL = "https://meteo.aquantialab.com"
 APP_BASE_URL = "https://meteo.aquantialab.com"   # URL base del QR de claim
@@ -95,6 +113,13 @@ NVS_GEN_GLOB_PATTERNS = [
 PROFILES = {
     "METEO  — 1 relay  (pantalla TFT)": "1",
     "IRRIGATION — 4 relays (sin pantalla)": "2",
+}
+
+DEFAULT_PROFILE_LABEL = "METEO  — 1 relay  (pantalla TFT)"
+DEFAULT_PROFILE = PROFILES[DEFAULT_PROFILE_LABEL]
+BOARD_LABEL_BY_PROFILE = {
+    "1": "LilyGo T-Display",
+    "2": "ESP32 genérico",
 }
 
 
@@ -133,7 +158,8 @@ def _git(*args, cwd=None):
         r = subprocess.run(
             ["git"] + list(args),
             cwd=cwd or REPO_ROOT,
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            **_WINDOWS_HIDDEN_SUBPROCESS
         )
         return r.stdout.strip() if r.returncode == 0 else ""
     except FileNotFoundError:
@@ -248,7 +274,8 @@ def export_version_to_temp(git_ref):
     try:
         archive = subprocess.run(
             archive_cmd, cwd=REPO_ROOT,
-            capture_output=True
+            capture_output=True,
+            **_WINDOWS_HIDDEN_SUBPROCESS
         )
         if archive.returncode != 0:
             return None
@@ -318,7 +345,8 @@ def read_partition_table(esptool, port):
                 hex(_PARTITION_TABLE_OFFSET),
                 hex(_PARTITION_TABLE_SIZE),
                 tmp_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         if r.returncode != 0:
             return None
         with open(tmp_path, "rb") as f:
@@ -366,7 +394,8 @@ def fp_read_mac(esptool, port):
     cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
     cmd += ["--port", port, "read_mac"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         for line in r.stdout.splitlines():
             if "MAC:" in line.upper():
                 parts = line.upper().split("MAC:")
@@ -382,7 +411,8 @@ def fp_read_flash_id(esptool, port):
     cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
     cmd += ["--port", port, "flash_id"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         for line in r.stdout.splitlines():
             low = line.lower()
             if "manufacturer" in low or "flash id" in low or "device" in low:
@@ -512,7 +542,8 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token,
         if nvs_gen:
             r = subprocess.run(
                 [sys.executable, nvs_gen, "generate", csv_path, bin_path, hex(size)],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=30,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             ok = r.returncode == 0
 
@@ -522,7 +553,8 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token,
             r = subprocess.run(
                 [sys.executable, "-m", "esp_idf_nvs_partition_gen",
                  "generate", csv_path, bin_path, hex(size)],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=30,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             ok = r.returncode == 0
 
@@ -533,7 +565,8 @@ def fp_write_nvs(esptool, nvs_gen, port, serial_number, token,
         # Flashear NVS en el offset de la partición NVS (por defecto 0x9000)
         cmd = ([sys.executable, esptool] if esptool.endswith(".py") else [esptool])
         cmd += ["--port", port, "write_flash", hex(offset), bin_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           **_WINDOWS_HIDDEN_SUBPROCESS)
         if r.returncode != 0:
             raise RuntimeError(f"Error flash NVS: {r.stderr.strip()}")
 
@@ -639,6 +672,23 @@ def save_metadata(meta):
         json.dump(meta, f, indent=2)
 
 
+def file_sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def short_digest(value, size=12):
+    if not value:
+        return "?"
+    return str(value)[:size]
+
+
 def source_files_newer_than_binary(bin_path):
     """True si algún archivo fuente es más reciente que el binario."""
     if not os.path.exists(bin_path):
@@ -652,7 +702,11 @@ def source_files_newer_than_binary(bin_path):
     return False
 
 
-def binary_is_valid(profile, git_ref):
+def get_fqbn_for_profile(profile):
+    return FQBN_BY_PROFILE.get(profile, "esp32:esp32:esp32")
+
+
+def binary_is_valid(profile, git_ref, fqbn=None, secrets_digest=None):
     """
     Comprueba si el binario compilado coincide con perfil+versión seleccionada
     y los fuentes no han cambiado desde la compilación.
@@ -667,6 +721,14 @@ def binary_is_valid(profile, git_ref):
 
     if meta.get("profile") != profile:
         return False, f"Perfil diferente (compilado: {meta.get('profile')})"
+
+    expected_fqbn = fqbn or get_fqbn_for_profile(profile)
+    compiled_fqbn = meta.get("fqbn")
+    if compiled_fqbn != expected_fqbn:
+        return False, "Placa/FQBN diferente — recompilar"
+
+    if secrets_digest and meta.get("secrets_digest") != secrets_digest:
+        return False, "Configuración local diferente — recompilar"
 
     compiled_ref = meta.get("git_ref")   # None = working copy
     if git_ref != compiled_ref:
@@ -725,7 +787,7 @@ class FlasherApp(tk.Tk):
         # ── Perfil ──
         tk.Label(self, text="Perfil:",
                  font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", **PAD)
-        self._profile_var = tk.StringVar(value=list(PROFILES.keys())[1])
+        self._profile_var = tk.StringVar(value=DEFAULT_PROFILE_LABEL)
         profile_cb = ttk.Combobox(self, textvariable=self._profile_var,
                                   values=list(PROFILES.keys()),
                                   state="readonly", width=38)
@@ -1063,14 +1125,19 @@ class FlasherApp(tk.Tk):
             self._set_status("Listo")
 
     def _log_line(self, text, color=None):
-        self._log.config(state="normal")
-        tag = None
-        if color:
-            tag = f"col_{color}"
-            self._log.tag_config(tag, foreground=color)
-        self._log.insert("end", text + "\n", tag or "")
-        self._log.see("end")
-        self._log.config(state="disabled")
+        def _do():
+            self._log.config(state="normal")
+            tag = None
+            if color:
+                tag = f"col_{color}"
+                self._log.tag_config(tag, foreground=color)
+            self._log.insert("end", text + "\n", tag or "")
+            self._log.see("end")
+            self._log.config(state="disabled")
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            self.after(0, _do)
 
     def _clear_log(self):
         self._log.config(state="normal")
@@ -1078,8 +1145,11 @@ class FlasherApp(tk.Tk):
         self._log.config(state="disabled")
 
     def _set_status(self, msg):
-        self._status_var.set(msg)
-        self.update_idletasks()
+        if threading.current_thread() is threading.main_thread():
+            self._status_var.set(msg)
+            self.update_idletasks()
+        else:
+            self.after(0, lambda: self._status_var.set(msg))
 
     def _set_busy(self, busy):
         self._busy = busy
@@ -1260,9 +1330,10 @@ class FlasherApp(tk.Tk):
         return None, sel
 
     def _refresh_binary_status(self):
-        profile = PROFILES.get(self._profile_var.get(), "?")
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
         git_ref, _ = self._get_selected_ref()
-        valid, msg = binary_is_valid(profile, git_ref)
+        secrets_digest = file_sha256(self._SECRETS_PATH)
+        valid, msg = binary_is_valid(profile, git_ref, get_fqbn_for_profile(profile), secrets_digest)
         if valid:
             self._bin_status_var.set(f"✓  {msg}")
             self._bin_status_lbl.config(fg="#4ec9b0")
@@ -1433,7 +1504,8 @@ class FlasherApp(tk.Tk):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                cwd=cwd or SKETCH_DIR
+                cwd=cwd or SKETCH_DIR,
+                **_WINDOWS_HIDDEN_SUBPROCESS
             )
             for line in proc.stdout:
                 line = line.rstrip("\n")
@@ -1553,9 +1625,12 @@ class FlasherApp(tk.Tk):
             messagebox.showerror("Error", "arduino-cli no encontrado.")
             return False, None
 
-        profile = PROFILES.get(self._profile_var.get(), "2")
+        profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+        fqbn = get_fqbn_for_profile(profile)
+        board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
         git_ref, ver_label = self._get_selected_ref()
         bin_path = os.path.join(BUILD_DIR, f"{SKETCH_NAME}.ino.bin")
+        secrets_digest = file_sha256(self._SECRETS_PATH)
         server_cfg = self._sync_server_settings(log_change=True)
         if not server_cfg:
             self._set_status("Configuración de servidor inválida")
@@ -1563,11 +1638,16 @@ class FlasherApp(tk.Tk):
 
         # ¿Podemos saltarnos la compilación?
         if not force:
-            valid, reason = binary_is_valid(profile, git_ref)
+            valid, reason = binary_is_valid(profile, git_ref, fqbn, secrets_digest)
             if valid:
-                self._log_line(f"✓  Binario en caché válido — omitiendo compilación", "#4ec9b0")
+                self._log_line(f"✓  Binario en caché válido — flasheando sin recompilar", "#4ec9b0")
                 self._log_line(f"   {reason}", "#888")
+                self._log_line(f"   Binario: {bin_path}", "#888")
+                self._log_line(f"   Secrets: {short_digest(secrets_digest)}", "#888")
                 return True, bin_path
+
+        if os.path.isdir(BUILD_DIR):
+            shutil.rmtree(BUILD_DIR, ignore_errors=True)
 
         # Preparar directorio de sketch
         sketch_path = self._get_sketch_for_ref(git_ref)
@@ -1578,7 +1658,11 @@ class FlasherApp(tk.Tk):
         os.makedirs(BUILD_DIR, exist_ok=True)
 
         self._log_line(f"\n{'─'*60}", "#444")
-        self._log_line(f"  COMPILANDO  perfil={profile}  versión={ver_label}", "#dcdcaa")
+        self._log_line(f"  COMPILANDO  perfil={profile}  placa={board_label}  versión={ver_label}", "#dcdcaa")
+        self._log_line(f"  FQBN: {fqbn}", "#888")
+        self._log_line(f"  Build dir: {BUILD_DIR}", "#888")
+        self._log_line(f"  Sketch: {sketch_path}", "#888")
+        self._log_line(f"  Secrets: {short_digest(secrets_digest)}", "#888")
         self._log_line(
             f"  Servidor: {self._server_target_var.get()} → {server_cfg['mqtt_server']}:{server_cfg['mqtt_port']}",
             "#888",
@@ -1588,8 +1672,9 @@ class FlasherApp(tk.Tk):
 
         cmd = [
             self._arduino_cli, "compile",
-            "--fqbn", FQBN,
-            "--build-property", f"build.extra_flags=-DDEVICE_PROFILE={profile}",
+            "--fqbn", fqbn,
+            "--build-property", f"compiler.cpp.extra_flags=-DDEVICE_PROFILE={profile}",
+            "--build-property", f"compiler.c.extra_flags=-DDEVICE_PROFILE={profile}",
             "--build-property", "build.partitions=min_spiffs",
             "--build-path", BUILD_DIR,
             sketch_path,
@@ -1600,13 +1685,17 @@ class FlasherApp(tk.Tk):
             size = os.path.getsize(bin_path)
             now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             save_metadata({
-                "version_label": ver_label,
-                "git_ref":       git_ref,
-                "profile":       profile,
-                "built_at":      now,
+                "version_label":  ver_label,
+                "git_ref":        git_ref,
+                "profile":        profile,
+                "fqbn":           fqbn,
+                "board_label":    board_label,
+                "secrets_digest": secrets_digest,
+                "built_at":       now,
                 "bin_size_bytes": size,
             })
             self._log_line(f"\n✓  Compilación OK — {size // 1024} KB", "#4ec9b0")
+            self._log_line(f"   Binario: {bin_path}", "#888")
             self._set_status(f"Compilado: {ver_label}  ({size // 1024} KB)")
         else:
             self._log_line("\n✗  Compilación fallida.\n", "#f44747")
@@ -1638,35 +1727,50 @@ class FlasherApp(tk.Tk):
         self._set_busy(True)
 
         def run():
-            self._start_progress("indeterminate")
-            ok, bin_path = self._do_compile()
-            if not ok:
+            try:
+                self._start_progress("indeterminate")
+                ok, bin_path = self._do_compile()
+                if not ok:
+                    self._stop_progress(False)
+                    return
+
+                profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+                fqbn = FQBN_BY_PROFILE.get(profile, "esp32:esp32:lilygo_t_display")
+                board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
+
+                git_ref, ver_label = self._get_selected_ref()
+                self._log_line(f"\n{'─'*60}", "#444")
+                self._log_line(f"  FLASH USB — {port} — {board_label}", "#dcdcaa")
+                self._log_line(f"{'─'*60}", "#444")
+                self._log_line(f"  Versión: {ver_label}", "#888")
+                self._log_line(f"  Perfil: {profile}", "#888")
+                self._log_line(f"  FQBN: {fqbn}", "#888")
+                self._log_line(f"  Binario: {bin_path}", "#888")
+                self._log_line("  ⚡  Entra en modo bootloader:", "#f0a000")
+                self._log_line("      1. Mantén pulsado GPIO0 (BOOT)", "#f0a000")
+                self._log_line("      2. Pulsa y suelta EN/RST", "#f0a000")
+                self._log_line("      3. Suelta GPIO0\n", "#f0a000")
+                self._set_status(f"Flasheando por USB en {port}...")
+                self._start_progress("determinate")
+
+                cmd = [self._arduino_cli, "upload",
+                       "--fqbn", fqbn, "--port", port,
+                       "--verbose",
+                       "--input-dir", BUILD_DIR, SKETCH_DIR]
+                ok, _ = self._run_cmd(cmd)
+                self._stop_progress(ok)
+                if ok:
+                    self._log_line("\n✓  Flash USB completado.\n", "#4ec9b0")
+                    self._set_status("Flash USB completado")
+                else:
+                    self._log_line("\n✗  Flash USB fallido.\n", "#f44747")
+                    self._set_status("Error en flash USB")
+            except Exception as e:
                 self._stop_progress(False)
-                self._set_busy(False)
-                return
-
-            self._log_line(f"\n{'─'*60}", "#444")
-            self._log_line(f"  FLASH USB — {port}", "#dcdcaa")
-            self._log_line(f"{'─'*60}", "#444")
-            self._log_line("  ⚡  Entra en modo bootloader:", "#f0a000")
-            self._log_line("      1. Mantén pulsado GPIO0 (BOOT)", "#f0a000")
-            self._log_line("      2. Pulsa y suelta EN/RST", "#f0a000")
-            self._log_line("      3. Suelta GPIO0\n", "#f0a000")
-            self._set_status(f"Flasheando por USB en {port}...")
-            self._start_progress("determinate")
-
-            cmd = [self._arduino_cli, "upload",
-                   "--fqbn", FQBN, "--port", port,
-                   "--input-dir", BUILD_DIR, SKETCH_DIR]
-            ok, _ = self._run_cmd(cmd)
-            self._stop_progress(ok)
-            if ok:
-                self._log_line("\n✓  Flash USB completado.\n", "#4ec9b0")
-                self._set_status("Flash USB completado")
-            else:
-                self._log_line("\n✗  Flash USB fallido.\n", "#f44747")
+                self._log_line(f"\n✗  Error inesperado en flash USB: {e}\n", "#f44747")
                 self._set_status("Error en flash USB")
-            self._set_busy(False)
+            finally:
+                self._set_busy(False)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1691,9 +1795,17 @@ class FlasherApp(tk.Tk):
                 self._set_busy(False)
                 return
 
+            profile = PROFILES.get(self._profile_var.get(), DEFAULT_PROFILE)
+            fqbn = get_fqbn_for_profile(profile)
+            board_label = BOARD_LABEL_BY_PROFILE.get(profile, "ESP32 genérico")
+            git_ref, ver_label = self._get_selected_ref()
             self._log_line(f"\n{'─'*60}", "#444")
-            self._log_line(f"  FLASH OTA — {ip}:3232", "#dcdcaa")
+            self._log_line(f"  FLASH OTA — {ip}:3232 — {board_label}", "#dcdcaa")
             self._log_line(f"{'─'*60}\n", "#444")
+            self._log_line(f"  Versión: {ver_label}", "#888")
+            self._log_line(f"  Perfil: {profile}", "#888")
+            self._log_line(f"  FQBN: {fqbn}", "#888")
+            self._log_line(f"  Binario: {bin_path}", "#888")
             self._set_status(f"Flasheando OTA a {ip}...")
             self._start_progress("determinate")
 
